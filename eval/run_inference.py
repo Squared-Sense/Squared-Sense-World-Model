@@ -119,6 +119,47 @@ def run_inference_episode(
     done = False
     last_info: Dict[str, Any] = {}
 
+    def _emit_current_frame(
+        curr_p: Any,
+        reward_val: float,
+        ret_val: float,
+        step_idx: int,
+        v_val: float,
+        probs: List[float],
+        chosen_act: int,
+    ) -> None:
+        if not hasattr(env, "extractor"):
+            return
+        tgt = tuple(getattr(env, "target_pos", getattr(env, "active_waypoint", target_pos)))
+        dist_val = float(np.linalg.norm(np.array(curr_p, dtype=float) - np.array(tgt, dtype=float)))
+        w_dx = float(tgt[0] - curr_p[0])
+        w_dy = float(tgt[1] - curr_p[1])
+        w_dz = float(tgt[2] - curr_p[2])
+        bc_rel = [(p[0] - curr_p[0], p[1] - curr_p[1], p[2] - curr_p[2]) for p in breadcrumbs]
+        bfs_rel = [(p[0] - curr_p[0], p[1] - curr_p[1], p[2] - curr_p[2]) for p in bfs_tuples[:64]]
+        telem = InferenceTelemetry.pack(
+            target_pos=(tgt[0], tgt[1], tgt[2]),
+            world_delta=(w_dx, w_dy, w_dz),
+            target_dist=dist_val,
+            step_reward=float(reward_val),
+            episode_return=float(ret_val),
+            step_count=step_idx,
+            critic_value=v_val,
+            action_probabilities=probs,
+            chosen_action=chosen_act,
+            l_bfs=int(round(l_ref)),
+            breadcrumbs=bc_rel,
+            optimal_path=bfs_rel,
+            checkpoint_loss=float(checkpoint_meta.get("loss", 0.0) if checkpoint_meta else 0.0),
+        )
+        c_str = getattr(env, "cardinal", "SOUTH")
+        f_idx = getattr(env, "foot_index", 6)
+        raw_v = env.extractor.extract_observation(tuple(curr_p), c_str, foot_index=f_idx)
+        emitter.emit_observation(raw_v, game_tick=step_idx, telemetry_bytes=telem)
+
+    # Emit initial spawn + target frame immediately (so --pause or slow JIT still shows target)
+    _emit_current_frame(player_pos, 0.0, 0.0, 0, 0.0, [0.0] * 12, 11)
+
     while not done:
         # Check non-blocking keyboard controls
         key_cmd = check_keyboard_input()
@@ -184,42 +225,7 @@ def run_inference_episode(
         # 4. Pack and Emit Inference Telemetry
         target_tuple = tuple(getattr(env, "target_pos", getattr(env, "active_waypoint", target_pos)))
         d_curr = float(np.linalg.norm(np.array(curr_player) - np.array(target_tuple)))
-
-        # Relative world delta for 3D visualizer beacon
-        world_dx = float(target_tuple[0] - curr_player[0])
-        world_dy = float(target_tuple[1] - curr_player[1])
-        world_dz = float(target_tuple[2] - curr_player[2])
-
-        # Relative path points for 3D visualizer
-        bc_rel = [(p[0] - curr_player[0], p[1] - curr_player[1], p[2] - curr_player[2]) for p in breadcrumbs]
-        bfs_rel = [(p[0] - curr_player[0], p[1] - curr_player[1], p[2] - curr_player[2]) for p in bfs_tuples[:64]]
-
-        telem_bytes = InferenceTelemetry.pack(
-            target_pos=(target_tuple[0], target_tuple[1], target_tuple[2]),
-            world_delta=(world_dx, world_dy, world_dz),
-            target_dist=d_curr,
-            step_reward=float(reward),
-            episode_return=float(ep_return),
-            critic_value=v_est,
-            action_probabilities=list(action_probs),
-            breadcrumbs=bc_rel,
-            optimal_path=bfs_rel,
-            checkpoint_loss=float(checkpoint_meta.get("loss", 0.0) if checkpoint_meta else 0.0),
-        )
-
-        # Emit raw observation to MMF slot
-        cardinal_str = getattr(env, "cardinal", "SOUTH")
-        foot_idx = getattr(env, "foot_index", 6)
-        yaw_val = getattr(env, "yaw", 0.0)
-        pitch_val = getattr(env, "camera_pitch", getattr(env, "pitch", 0.0))
-
-        if hasattr(env, "extractor"):
-            raw_view = env.extractor.extract_observation(tuple(curr_player), cardinal_str, foot_index=foot_idx)
-            emitter.emit_observation(
-                raw_view,
-                game_tick=step_count,
-                telemetry_bytes=telem_bytes,
-            )
+        _emit_current_frame(curr_player, float(reward), float(ep_return), step_count, v_est, list(action_probs), action)
 
         act_name = ACTION_NAMES[action] if action < len(ACTION_NAMES) else f"ACT_{action}"
         print(
