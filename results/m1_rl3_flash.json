@@ -1,0 +1,20 @@
+{
+  "success_rate_pct": 15.0,
+  "spl": 0.15,
+  "spl_pct": 15.0,
+  "chns": 9.89010989010989,
+  "compass_visible_pct": 1.360863444392304,
+  "compass_occlusion_prob": 0.0,
+  "flash_compass_ticks": 3,
+  "waypoint_completion_pct": 15.0,
+  "mean_targets_reached": 0.15,
+  "num_targets": 1,
+  "hazard_collision_rate_pct": 0.0,
+  "empirical_mflops_per_step": 1791.3,
+  "latency_ms_per_step": 28.300437001232407,
+  "use_gating": false,
+  "total_episodes": 20,
+  "total_steps": 4262,
+  "mean_episode_length": 213.1,
+  "avg_steps_to_target_1": 4.0
+}

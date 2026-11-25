@@ -229,3 +229,31 @@
 [2026-11-25 23:25:56] [Nav Eval] [Eval Courses | Step 18/20] SR%: 33.3333 | SPL: 0.2788 | WPs: 6 | Haz%: 44.4444 | 35.55s/step | Elapsed: 10m40s | ETA: 01m11s
 [2026-11-25 23:26:33] [Nav Eval] [Eval Courses | Step 19/20] SR%: 31.5789 | SPL: 0.2641 | WPs: 6 | Haz%: 47.3684 | 35.63s/step | Elapsed: 11m17s | ETA: 36s
 [2026-11-25 23:26:48] [Nav Eval] [Eval Courses | Step 20/20] SR%: 30.0000 | SPL: 0.2509 | WPs: 6 | Haz%: 50.0000 | 34.56s/step | Elapsed: 11m31s
+[2026-11-26 01:58:52] [Nav Eval] [Eval Courses | Step 1/2] (50.0%) |  5.73s/step | Elapsed: 06s | ETA: 06s | SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000
+[2026-11-26 01:58:57] [Nav Eval] [Eval Courses | Step 2/2] (100.0%) |  5.62s/step | Elapsed: 11s | ETA: 00s | SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000
+[2026-11-26 01:59:00] [Nav Eval] [Eval Courses | Step 1/2] (50.0%) |  2.08s/step | Elapsed: 02s | ETA: 02s | SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000
+[2026-11-26 01:59:01] [Nav Eval] [Eval Courses | Step 2/2] (100.0%) |  1.42s/step | Elapsed: 03s | ETA: 00s | SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000
+[2026-11-26 01:59:12] [Nav Eval] [Eval Courses | Step 1/2] (50.0%) |   1.3step/s | Elapsed: 01s | ETA: 01s | SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000
+[2026-11-26 01:59:13] [Nav Eval] [Eval Courses | Step 2/2] (100.0%) |   1.3step/s | Elapsed: 02s | ETA: 00s | SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000
+[2026-11-26 01:59:13] [Nav Eval] [Eval Courses | Step 1/2] (50.0%) |  28.7step/s | Elapsed: 00s | ETA: 00s | SR%: 100.0000 | SPL: 1.0000 | WPs: 1 | Haz%: 0.0000
+[2026-11-26 01:59:13] [Nav Eval] [Eval Courses | Step 2/2] (100.0%) |  36.4step/s | Elapsed: 00s | ETA: 00s | SR%: 100.0000 | SPL: 1.0000 | WPs: 2 | Haz%: 0.0000
+[2026-11-26 02:07:00] [Nav Eval] [Eval Courses | Step 01/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 75.02s/step | Elapsed: 01m15s | ETA: 23m45s
+[2026-11-26 02:08:18] [Nav Eval] [Eval Courses | Step 02/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 76.53s/step | Elapsed: 02m33s | ETA: 22m58s
+[2026-11-26 02:10:01] [Nav Eval] [Eval Courses | Step 03/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 85.17s/step | Elapsed: 04m15s | ETA: 24m08s
+[2026-11-26 02:11:39] [Nav Eval] [Eval Courses | Step 04/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 88.42s/step | Elapsed: 05m54s | ETA: 23m35s
+[2026-11-26 02:13:12] [Nav Eval] [Eval Courses | Step 05/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 89.36s/step | Elapsed: 07m27s | ETA: 22m20s
+[2026-11-26 02:14:52] [Nav Eval] [Eval Courses | Step 06/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 91.08s/step | Elapsed: 09m06s | ETA: 21m15s
+[2026-11-26 02:16:29] [Nav Eval] [Eval Courses | Step 07/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 91.97s/step | Elapsed: 10m44s | ETA: 19m56s
+[2026-11-26 02:18:10] [Nav Eval] [Eval Courses | Step 08/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 93.08s/step | Elapsed: 12m25s | ETA: 18m37s
+[2026-11-26 02:19:53] [Nav Eval] [Eval Courses | Step 09/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 94.25s/step | Elapsed: 14m08s | ETA: 17m17s
+[2026-11-26 02:21:15] [Nav Eval] [Eval Courses | Step 10/20] SR%: 0.0000 | SPL: 0.0000 | WPs: 0 | Haz%: 0.0000 | 92.97s/step | Elapsed: 15m30s | ETA: 15m30s
+[2026-11-26 02:21:15] [Nav Eval] [Eval Courses | Step 11/20] SR%: 9.0909 | SPL: 0.0909 | WPs: 1 | Haz%: 0.0000 | 84.57s/step | Elapsed: 15m30s | ETA: 12m41s
+[2026-11-26 02:22:40] [Nav Eval] [Eval Courses | Step 12/20] SR%: 8.3333 | SPL: 0.0833 | WPs: 1 | Haz%: 0.0000 | 84.56s/step | Elapsed: 16m55s | ETA: 11m16s
+[2026-11-26 02:22:41] [Nav Eval] [Eval Courses | Step 13/20] SR%: 15.3846 | SPL: 0.1538 | WPs: 2 | Haz%: 0.0000 | 78.13s/step | Elapsed: 16m56s | ETA: 09m07s
+[2026-11-26 02:24:15] [Nav Eval] [Eval Courses | Step 14/20] SR%: 14.2857 | SPL: 0.1429 | WPs: 2 | Haz%: 0.0000 | 79.24s/step | Elapsed: 18m29s | ETA: 07m55s
+[2026-11-26 02:25:34] [Nav Eval] [Eval Courses | Step 15/20] SR%: 13.3333 | SPL: 0.1333 | WPs: 2 | Haz%: 0.0000 | 79.26s/step | Elapsed: 19m49s | ETA: 06m36s
+[2026-11-26 02:25:36] [Nav Eval] [Eval Courses | Step 16/20] SR%: 18.7500 | SPL: 0.1875 | WPs: 3 | Haz%: 0.0000 | 74.45s/step | Elapsed: 19m51s | ETA: 04m58s
+[2026-11-26 02:26:52] [Nav Eval] [Eval Courses | Step 17/20] SR%: 17.6471 | SPL: 0.1765 | WPs: 3 | Haz%: 0.0000 | 74.52s/step | Elapsed: 21m07s | ETA: 03m44s
+[2026-11-26 02:28:09] [Nav Eval] [Eval Courses | Step 18/20] SR%: 16.6667 | SPL: 0.1667 | WPs: 3 | Haz%: 0.0000 | 74.68s/step | Elapsed: 22m24s | ETA: 02m29s
+[2026-11-26 02:29:37] [Nav Eval] [Eval Courses | Step 19/20] SR%: 15.7895 | SPL: 0.1579 | WPs: 3 | Haz%: 0.0000 | 75.38s/step | Elapsed: 23m52s | ETA: 01m15s
+[2026-11-26 02:31:00] [Nav Eval] [Eval Courses | Step 20/20] SR%: 15.0000 | SPL: 0.1500 | WPs: 3 | Haz%: 0.0000 | 75.73s/step | Elapsed: 25m15s
