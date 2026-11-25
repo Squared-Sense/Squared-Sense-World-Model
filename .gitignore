@@ -17,3 +17,6 @@ data/baked_regions
 
 checkpoints
 episodes
+OtherWorlds/*/raw_regions/
+OtherWorlds/*/baked_regions/
+logs/

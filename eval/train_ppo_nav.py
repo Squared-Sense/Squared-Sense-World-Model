@@ -13,6 +13,7 @@ Strictly follows docs/EVAL_CONTRACT.md and docs/MODEL_CONTRACT.md.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import os
@@ -41,6 +42,7 @@ from models.baselines import Generative3DMAE, SingleLODJEPA
 from models.temporal_lstm import DualLSTMTemporalIntegrator
 from models.transformer import MultiLODBackbone, SpatialJEPA
 from train.checkpoint import load_checkpoint, save_checkpoint
+from train.diagnostics import ProgressBar
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +114,25 @@ class ActorCriticHead(nnx.Module):
 # Frozen Feature Extraction Helper
 # ---------------------------------------------------------------------------
 
+@nnx.jit
+def _forward_encoder_tokens(encoder: Any, shells_arr: jax.Array) -> jax.Array:
+    """JIT-compiled single-step frozen perception forward pass."""
+    return jax.lax.stop_gradient(encoder(shells_arr, visible_idx=None))
+
+
+@nnx.jit
+def _forward_temporal_step(
+    temporal_model: Any,
+    tokens: jax.Array,
+    state_arr: jax.Array,
+    act_arr: jax.Array,
+    hidden: Any,
+) -> Tuple[jax.Array, Any]:
+    """JIT-compiled single-step temporal integration."""
+    _, c_t, next_hidden = temporal_model.step(tokens, state_arr, act_arr, hidden)
+    return jax.lax.stop_gradient(c_t), next_hidden
+
+
 def extract_step_feature(
     backbone: Any,
     model_type: str,
@@ -125,7 +146,7 @@ def extract_step_feature(
 
     Args:
         backbone: Initialized/trained perception backbone module.
-        model_type: In {"m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae"}.
+        model_type: In {"m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae", "b0_blind"}.
         shells: (3, 16, 16, 16, 16) or (1, 3, 16, 16, 16, 16) float32 shells array in [0, 1].
         state: Optional (12,) proprioceptive state.
         action: Optional scalar action taken at previous step.
@@ -137,26 +158,29 @@ def extract_step_feature(
           - feat: (1, feat_dim) JAX array
           - updated_temporal_hidden: updated hidden state or None
     """
+    if model_type == "b0_blind":
+        return jnp.zeros((1, 0), dtype=jnp.float32), None
+
     shells_arr = jnp.asarray(shells, dtype=jnp.float32)
     if shells_arr.ndim == 5:
         shells_arr = jnp.expand_dims(shells_arr, axis=0)
 
-    # 1. Static Feature Extraction (zero gradient stop_gradient)
+    # 1. Static Feature Extraction (zero gradient stop_gradient via @nnx.jit)
     if model_type in ("m2_static", "m1_full"):
         encoder = backbone.context_encoder if hasattr(backbone, "context_encoder") else backbone
-        tokens = jax.lax.stop_gradient(encoder(shells_arr, visible_idx=None))
+        tokens = _forward_encoder_tokens(encoder, shells_arr)
         z_static = jnp.mean(tokens, axis=1)  # (1, 256)
     elif model_type == "b1_lod0":
         encoder = backbone.context_encoder if hasattr(backbone, "context_encoder") else backbone
-        tokens = jax.lax.stop_gradient(encoder(shells_arr[:, 0:1], visible_idx=None))
+        tokens = _forward_encoder_tokens(encoder, shells_arr[:, 0:1])
         z_static = jnp.mean(tokens, axis=1)  # (1, 256)
     elif model_type == "b2_lod2":
         encoder = backbone.context_encoder if hasattr(backbone, "context_encoder") else backbone
-        tokens = jax.lax.stop_gradient(encoder(shells_arr[:, 2:3], visible_idx=None))
+        tokens = _forward_encoder_tokens(encoder, shells_arr[:, 2:3])
         z_static = jnp.mean(tokens, axis=1)  # (1, 256)
     elif model_type == "b3_mae":
         encoder = backbone.encoder if hasattr(backbone, "encoder") else backbone
-        tokens = jax.lax.stop_gradient(encoder(shells_arr, visible_idx=None))
+        tokens = _forward_encoder_tokens(encoder, shells_arr)
         z_static = jnp.mean(tokens, axis=1)  # (1, 256)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
@@ -171,8 +195,7 @@ def extract_step_feature(
         state_arr = jnp.zeros((1, 12), dtype=jnp.float32) if state is None else jnp.asarray(state, dtype=jnp.float32).reshape((1, 12))
         act_arr = jnp.zeros((1,), dtype=jnp.int32) if action is None else jnp.asarray([action], dtype=jnp.int32)
 
-        _, c_t, next_hidden = temporal_model.step(tokens, state_arr, act_arr, temporal_hidden)
-        c_t = jax.lax.stop_gradient(c_t)  # (1, 192)
+        c_t, next_hidden = _forward_temporal_step(temporal_model, tokens, state_arr, act_arr, temporal_hidden)
         feat = jnp.concatenate([z_static, c_t], axis=-1)  # (1, 448)
         return feat, next_hidden
 
@@ -294,16 +317,64 @@ def bc_update_step(
 # Behavioral Cloning Warm-Start
 # ---------------------------------------------------------------------------
 
+def select_bc_oracle_action(env: Any, obs: Dict[str, np.ndarray]) -> int:
+    """Selects oracle action for BC demonstration.
+
+    If env has `optimal_path` (BFS path), steers toward the next unreached node,
+    converting that local step delta into egocentric coordinates and prioritizing
+    turning (Action 6 Turn-Left, Action 7 Turn-Right) when the next step is not in front.
+    Otherwise falls back to select_heuristic_action on obs["goal_vec"].
+    """
+    from env.record_episodes import select_heuristic_action
+
+    action_mask = obs.get("action_mask", None)
+    path = getattr(env, "optimal_path", None)
+    player_pos = getattr(env, "player_pos", None)
+    cardinal = getattr(env, "cardinal", None)
+
+    if path and len(path) >= 2 and player_pos is not None and cardinal is not None:
+        from env.minecraft_env import CARDINAL_VECTORS
+
+        # Find next unreached node along path
+        dists = [np.linalg.norm(np.array(p) - player_pos) for p in path]
+        curr_idx = int(np.argmin(dists))
+
+        target_node = path[-1]
+        for idx in range(curr_idx, len(path)):
+            if np.linalg.norm(np.array(path[idx]) - player_pos) >= 0.7:
+                target_node = path[idx]
+                break
+
+        world_dx = float(target_node[0] - player_pos[0])
+        world_dy = float(target_node[1] - player_pos[1])
+        world_dz = float(target_node[2] - player_pos[2])
+
+        fwd_v = CARDINAL_VECTORS[cardinal]["forward"]
+        right_v = CARDINAL_VECTORS[cardinal]["right"]
+
+        ego_gx = float(world_dx * right_v[0] + world_dz * right_v[1])
+        ego_gz = float(world_dx * fwd_v[0] + world_dz * fwd_v[1])
+        ego_gy = float(world_dy)
+
+        local_goal = np.array([ego_gx, ego_gy, ego_gz], dtype=np.float32)
+        return select_heuristic_action(local_goal, action_mask)
+
+    return select_heuristic_action(obs["goal_vec"], action_mask)
+
+
 def train_bc_warmstart(
     policy: ActorCriticHead,
     optimizer: nnx.Optimizer,
     dataset: Optional[Dict[str, np.ndarray]] = None,
-    env: Optional[VoxelNavEnv] = None,
+    env: Optional[Any] = None,
     backbone: Optional[Any] = None,
     model_type: str = "m2_static",
+    temporal_model: Optional[DualLSTMTemporalIntegrator] = None,
     epochs: int = 5,
     batch_size: int = 32,
+    num_demo_steps: int = 500,
     seed: int = 42,
+    save_dir: Optional[str] = None,
 ) -> List[float]:
     """Train ActorCriticHead via Behavioral Cloning cross-entropy minimization.
 
@@ -314,29 +385,59 @@ def train_bc_warmstart(
         env: Optional environment to generate expert demos if dataset is None.
         backbone: Perception backbone used if collecting demos.
         model_type: Model type identifier.
+        temporal_model: Optional temporal model for m1_full.
         epochs: Number of training epochs.
         batch_size: Mini-batch size.
+        num_demo_steps: Number of transitions to collect across episodes if dataset is None.
         seed: Random seed.
+        save_dir: Optional directory to append training log.
 
     Returns:
         List of epoch cross-entropy losses.
     """
     if dataset is None:
-        if env is None or backbone is None:
+        if env is None or (backbone is None and model_type != "b0_blind"):
             return []
-        # Generate simple expert trajectory (straight walk on bridge, action 0)
+
+        # Collect diverse multi-episode oracle demonstrations
         feats_list = []
         goals_list = []
         acts_list = []
-        obs = env.reset()
-        for _ in range(35):
-            feat, _ = extract_step_feature(backbone, model_type, obs["shells"], obs["state"])
+        rng_demo = np.random.default_rng(seed)
+
+        try:
+            obs = env.reset(seed=int(rng_demo.integers(0, 1_000_000)))
+        except TypeError:
+            obs = env.reset()
+        temporal_hidden = None
+
+        for _ in range(num_demo_steps):
+            feat, temporal_hidden = extract_step_feature(
+                backbone=backbone,
+                model_type=model_type,
+                shells=obs["shells"],
+                state=obs["state"],
+                temporal_model=temporal_model,
+                temporal_hidden=temporal_hidden,
+            )
+            goal_v = obs["goal_vec"]
+            action = select_bc_oracle_action(env, obs)
+
             feats_list.append(np.asarray(feat[0]))
-            goals_list.append(np.asarray(obs["goal_vec"]))
-            acts_list.append(0)  # Action 0: Forward
-            obs, _, done, _ = env.step(action=0)
+            goals_list.append(np.asarray(goal_v))
+            acts_list.append(int(action))
+
+            obs, _, done, _ = env.step(action=action)
             if done:
-                break
+                try:
+                    obs = env.reset(seed=int(rng_demo.integers(0, 1_000_000)))
+                except TypeError:
+                    obs = env.reset()
+                temporal_hidden = None
+
+        if not feats_list:
+            return []
+
         dataset = {
             "feats": np.stack(feats_list, axis=0),
             "goal_vecs": np.stack(goals_list, axis=0),
@@ -350,6 +451,15 @@ def train_bc_warmstart(
 
     rng = np.random.default_rng(seed)
     epoch_losses = []
+    log_file = os.path.join(save_dir, "train.log") if save_dir else None
+    pb = ProgressBar(
+        total=epochs,
+        prefix="BC Warm-Start",
+        bar_len=20,
+        log_every=1,
+        log_file=log_file,
+        process_tag="BC Warm-Start",
+    )
 
     for ep in range(epochs):
         indices = rng.permutation(n_samples)
@@ -364,6 +474,7 @@ def train_bc_warmstart(
             batch_losses.append(float(loss))
         mean_loss = float(np.mean(batch_losses))
         epoch_losses.append(mean_loss)
+        pb.update(ep + 1, metrics={"loss": mean_loss})
 
     return epoch_losses
 
@@ -437,11 +548,32 @@ def train_ppo(
     if smoke_test:
         num_updates = 2
 
-    current_obs = env.reset()
+    try:
+        current_obs = env.reset(seed=int(np_rng.integers(0, 1_000_000)))
+    except TypeError:
+        current_obs = env.reset()
     temporal_hidden = None
     step_count = 0
     best_reward = -float("inf")
+    best_stage = int(getattr(getattr(env, "curriculum", None), "stage", 0))
     metrics_history = []
+    rolling_success: deque = deque(maxlen=20)
+    rolling_ep_returns: deque = deque(maxlen=20)
+    rolling_targets_reached: deque = deque(maxlen=20)
+    num_targets_env = int(getattr(env, "num_targets", 1))
+    rolling_target_steps: Dict[int, deque] = {
+        k: deque(maxlen=20) for k in range(1, num_targets_env + 1)
+    }
+
+    log_file = os.path.join(save_dir, "train.log")
+    pb = ProgressBar(
+        total=num_updates,
+        prefix="PPO Train",
+        bar_len=24,
+        log_every=1,
+        log_file=log_file,
+        process_tag="PPO Nav",
+    )
 
     print(f"Starting PPO Training: {num_updates} updates, {rollout_steps} steps/rollout, model={model_type}")
 
@@ -454,6 +586,7 @@ def train_ppo(
         b_rewards = []
         b_dones = []
         b_values = []
+        b_infos = []
 
         episode_rewards = []
         current_ep_reward = 0.0
@@ -486,11 +619,24 @@ def train_ppo(
             b_rewards.append(reward)
             b_dones.append(done)
             b_values.append(v_est)
+            b_infos.append(info)
 
             if done:
                 episode_rewards.append(current_ep_reward)
+                rolling_ep_returns.append(current_ep_reward)
+                is_succ = bool(info.get("success", False))
+                rolling_success.append(1.0 if is_succ else 0.0)
+                rolling_targets_reached.append(
+                    float(info.get("targets_reached", 1 if is_succ else 0))
+                )
+                for t_k, t_step in enumerate(info.get("target_reach_steps", []), start=1):
+                    if t_k in rolling_target_steps:
+                        rolling_target_steps[t_k].append(float(t_step))
                 current_ep_reward = 0.0
-                current_obs = env.reset()
+                try:
+                    current_obs = env.reset(seed=int(np_rng.integers(0, 1_000_000)))
+                except TypeError:
+                    current_obs = env.reset()
                 temporal_hidden = None
             else:
                 current_obs = next_obs
@@ -574,6 +720,15 @@ def train_ppo(
         mean_ent = float(np.mean(epoch_ents))
         mean_rew = float(np.mean(arr_rewards))
 
+        turn_count = int(np.sum(np.isin(b_actions, [6, 7, 9, 10])))
+        turn_pct = float(turn_count / len(b_actions) * 100.0) if len(b_actions) > 0 else 0.0
+        blocked_count = int(sum(1 for inf in b_infos if inf.get("blocked", False)))
+        blocked_pct = float(blocked_count / len(b_actions) * 100.0) if len(b_actions) > 0 else 0.0
+        sr_pct = float(np.mean(rolling_success) * 100.0) if len(rolling_success) > 0 else 0.0
+        rolling_mean_rew = float(np.mean(rolling_ep_returns)) if len(rolling_ep_returns) > 0 else mean_rew
+        mean_targets = float(np.mean(rolling_targets_reached)) if len(rolling_targets_reached) > 0 else 0.0
+        full5_pct = sr_pct
+
         record = {
             "update": update_idx + 1,
             "total_steps": step_count,
@@ -582,27 +737,79 @@ def train_ppo(
             "value_loss": mean_v_loss,
             "entropy": mean_ent,
             "mean_step_reward": mean_rew,
+            "rolling_ep_return": rolling_mean_rew,
+            "success_rate": sr_pct,
+            "mean_targets_reached": mean_targets,
+            "num_targets": num_targets_env,
+            "full5_rate": full5_pct,
+            "turn_pct": turn_pct,
+            "blocked_pct": blocked_pct,
         }
+        for t_k in range(1, num_targets_env + 1):
+            q_k = rolling_target_steps[t_k]
+            record[f"avg_steps_to_target_{t_k}"] = float(np.mean(q_k)) if len(q_k) > 0 else None
         metrics_history.append(record)
 
         # Append to ppo_metrics.jsonl
         with open(metrics_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
-        print(
-            f"Update {update_idx + 1}/{num_updates} | "
-            f"Steps: {step_count} | Loss: {mean_loss:.4f} | "
-            f"Policy: {mean_p_loss:.4f} | Value: {mean_v_loss:.4f} | "
-            f"Entropy: {mean_ent:.4f} | MeanRew: {mean_rew:.3f}"
+        pb.update(
+            update_idx + 1,
+            metrics={
+                "steps": step_count,
+                "loss": mean_loss,
+                "rew": rolling_mean_rew,
+                "Tgt": f"{mean_targets:.2f}/{num_targets_env}",
+                "Full5%": f"{full5_pct:.0f}%",
+                "SR%": f"{sr_pct:.0f}%",
+                "Turn%": f"{turn_pct:.1f}%",
+                "Blk%": f"{blocked_pct:.1f}%",
+            },
         )
 
-        # Save policy_best.pkl
-        if mean_rew >= best_reward or update_idx == num_updates - 1:
-            best_reward = mean_rew
+        # Checkpointing: best_ppo.pkl and latest_ppo.pkl
+        meta = {
+            "model_type": model_type,
+            "update": update_idx + 1,
+            "total_steps": step_count,
+            "mean_reward": rolling_mean_rew,
+            "success_rate": sr_pct,
+            "turn_pct": turn_pct,
+            "blocked_pct": blocked_pct,
+        }
+        for t_k in range(1, num_targets_env + 1):
+            q_k = rolling_target_steps[t_k]
+            record[f"avg_steps_to_target_{t_k}"] = float(np.mean(q_k)) if len(q_k) > 0 else None
+
+        curr_stage = int(getattr(getattr(env, "curriculum", None), "stage", 0))
+        if num_targets_env == 1 and curr_stage > best_stage:
+            best_stage = curr_stage
+            best_reward = rolling_mean_rew
+            should_save_best = True
+        elif rolling_mean_rew >= best_reward:
+            best_reward = rolling_mean_rew
+            should_save_best = True
+        else:
+            should_save_best = False
+
+        if should_save_best:
+            save_checkpoint(
+                os.path.join(save_dir, "best_ppo.pkl"),
+                policy,
+                metadata=meta,
+            )
             save_checkpoint(
                 os.path.join(save_dir, "policy_best.pkl"),
                 policy,
-                metadata={"model_type": model_type, "update": update_idx + 1, "mean_reward": mean_rew},
+                metadata=meta,
+            )
+
+        if (update_idx + 1) % 10 == 0 or update_idx == num_updates - 1:
+            save_checkpoint(
+                os.path.join(save_dir, "latest_ppo.pkl"),
+                policy,
+                metadata=meta,
             )
 
     return {
@@ -626,8 +833,8 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--model_type",
         type=str,
         default="m2_static",
-        choices=["m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae"],
-        help="Frozen perception backbone architecture.",
+        choices=["m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae", "b0_blind"],
+        help="Frozen perception backbone architecture (or b0_blind for compass-only baseline).",
     )
     parser.add_argument(
         "--ckpt",
@@ -668,8 +875,57 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--bc_epochs",
         type=int,
-        default=0,
-        help="Number of Behavioral Cloning warm-start epochs (0 to skip).",
+        default=None,
+        help="Number of Behavioral Cloning warm-start epochs (0 to skip; defaults to 0).",
+    )
+    parser.add_argument(
+        "--bc_steps",
+        type=int,
+        default=500,
+        help="Number of oracle demonstration transitions to collect for BC warm-start (default: 500).",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="rl1",
+        choices=["rl1", "rl2", "rl3_beacon", "rl3_flash", "rl4_beacon", "rl4_flash"],
+        help="Navigation task mode: rl1, rl2, rl3_beacon, rl3_flash, rl4_beacon, or rl4_flash.",
+    )
+    parser.add_argument(
+        "--num_targets",
+        type=int,
+        default=None,
+        help="Number of chained targets per episode (defaults to 1 for rl1/rl3, 5 for rl2/rl4).",
+    )
+    parser.add_argument(
+        "--compass_occlusion",
+        type=float,
+        default=None,
+        help="Probability of compass occlusion bursts (defaults to 0.0 for rl1/flash, 0.5 for rl2, 1.0 for beacon).",
+    )
+    parser.add_argument(
+        "--occlusion_burst",
+        type=int,
+        default=6,
+        help="Contiguous burst length in ticks for compass occlusion (default: 6).",
+    )
+    parser.add_argument(
+        "--flash_compass_ticks",
+        type=int,
+        default=None,
+        help="Number of initial ticks per target leg with visible compass in flash mode (defaults to 3 for rl3_flash/rl4_flash, 0 otherwise).",
+    )
+    parser.add_argument(
+        "--init_policy",
+        type=str,
+        default=None,
+        help="Optional path to a pretrained RL1 ActorCriticHead .pkl checkpoint to fine-tune from.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=3e-4,
+        help="AdamW learning rate for ActorCriticHead (default: 3e-4).",
     )
     parser.add_argument(
         "--smoke_test",
@@ -728,22 +984,78 @@ def main(args: Optional[List[str]] = None) -> int:
     elif opts.model_type == "b3_mae":
         backbone = Generative3DMAE(rngs=rng)
         feat_dim = 256
+    elif opts.model_type == "b0_blind":
+        backbone = None
+        feat_dim = 0
     else:
         raise ValueError(f"Unknown model_type: {opts.model_type}")
 
-    if opts.ckpt and os.path.exists(opts.ckpt):
+    # Auto-resolve backbone checkpoint if not specified
+    if opts.model_type != "b0_blind" and not opts.ckpt:
+        for candidate in [
+            "checkpoints/spatial_finetuned_best.pkl",
+            "checkpoints/m1_full_temporal/spatial_finetuned_best.pkl",
+            "checkpoints/m2_spatial_jepa/best.pkl",
+        ]:
+            if os.path.isfile(candidate):
+                opts.ckpt = candidate
+                break
+
+    # Auto-resolve temporal checkpoint if not specified and m1_full
+    if opts.model_type == "m1_full" and not opts.temporal_ckpt:
+        for candidate in [
+            "checkpoints/temporal_best.pkl",
+            "checkpoints/m1_full_temporal/temporal_best.pkl",
+        ]:
+            if os.path.isfile(candidate):
+                opts.temporal_ckpt = candidate
+                break
+
+    if backbone is not None and opts.ckpt and os.path.exists(opts.ckpt):
         print(f"Loading backbone checkpoint from {opts.ckpt}...")
         load_checkpoint(opts.ckpt, backbone)
+    elif backbone is not None and opts.ckpt:
+        print(f"Warning: backbone checkpoint not found at {opts.ckpt}, proceeding with initial weights.")
 
     if temporal_model and opts.temporal_ckpt and os.path.exists(opts.temporal_ckpt):
         print(f"Loading temporal checkpoint from {opts.temporal_ckpt}...")
         load_checkpoint(opts.temporal_ckpt, temporal_model)
+    elif temporal_model and opts.temporal_ckpt:
+        print(f"Warning: temporal checkpoint not found at {opts.temporal_ckpt}, proceeding with initial weights.")
 
     # 2. Instantiate Environment
+    task_defaults = {
+        "rl1": (1, 0.0, 0),
+        "rl2": (5, 0.5, 0),
+        "rl3_beacon": (1, 1.0, 0),
+        "rl3_flash": (1, 0.0, 3),
+        "rl4_beacon": (5, 1.0, 0),
+        "rl4_flash": (5, 0.0, 3),
+    }
+    def_targets, def_occ, def_flash = task_defaults[opts.task]
+    num_targets = opts.num_targets if opts.num_targets is not None else def_targets
+    compass_occlusion = (
+        opts.compass_occlusion if opts.compass_occlusion is not None else def_occ
+    )
+    flash_compass_ticks = (
+        opts.flash_compass_ticks if opts.flash_compass_ticks is not None else def_flash
+    )
+
     if opts.region_dir and os.path.isdir(opts.region_dir):
         from env.minecraft_env import MinecraftNavEnv
-        print(f"Instantiating MinecraftNavEnv on real terrain from {opts.region_dir}...")
-        env = MinecraftNavEnv(region_dir=opts.region_dir)
+        print(
+            f"Instantiating MinecraftNavEnv on real terrain from {opts.region_dir} "
+            f"(task={opts.task}, num_targets={num_targets}, compass_occlusion={compass_occlusion}, "
+            f"flash_ticks={flash_compass_ticks}, burst={opts.occlusion_burst})..."
+        )
+        env = MinecraftNavEnv(
+            region_dir=opts.region_dir,
+            num_targets=num_targets,
+            compass_occlusion_prob=compass_occlusion,
+            occlusion_burst_len=opts.occlusion_burst,
+            flash_compass_ticks=flash_compass_ticks,
+            skip_shells=(opts.model_type == "b0_blind"),
+        )
     elif opts.courses_dir and os.path.isdir(opts.courses_dir):
         from eval.eval_navigation import load_courses_from_dir
         courses = load_courses_from_dir(opts.courses_dir)
@@ -757,23 +1069,33 @@ def main(args: Optional[List[str]] = None) -> int:
 
     # 3. Instantiate Trainable ActorCriticHead & Optax Optimizer
     policy = ActorCriticHead(feat_dim=feat_dim, num_actions=12, rngs=rng)
+    if opts.init_policy:
+        if not os.path.exists(opts.init_policy):
+            raise FileNotFoundError(f"Initial policy checkpoint not found: {opts.init_policy}")
+        print(f"Loading initial ActorCriticHead weights from {opts.init_policy}...")
+        load_checkpoint(opts.init_policy, policy)
+
     tx = optax.chain(
         optax.clip_by_global_norm(0.5),
-        optax.adamw(learning_rate=3e-4, weight_decay=1e-4),
+        optax.adamw(learning_rate=opts.lr, weight_decay=1e-4),
     )
     optimizer = nnx.Optimizer(policy, tx, wrt=nnx.Param)
 
-    # 4. Optional BC Warm-Start
-    if opts.bc_epochs > 0:
-        print(f"Running BC Warm-Start for {opts.bc_epochs} epochs...")
+    # 4. Optional BC Warm-Start (skipped by default when --init_policy is provided)
+    bc_epochs = opts.bc_epochs if opts.bc_epochs is not None else 0
+    if bc_epochs > 0:
+        print(f"Running BC Warm-Start for {bc_epochs} epochs...")
         bc_losses = train_bc_warmstart(
             policy=policy,
             optimizer=optimizer,
             env=env,
             backbone=backbone,
             model_type=opts.model_type,
-            epochs=opts.bc_epochs,
+            temporal_model=temporal_model,
+            epochs=bc_epochs,
+            num_demo_steps=opts.bc_steps,
             seed=opts.seed,
+            save_dir=opts.save_dir,
         )
         print(f"BC Warm-Start completed: final loss = {bc_losses[-1]:.4f}")
 

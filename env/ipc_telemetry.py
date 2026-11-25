@@ -16,6 +16,7 @@ TELEMETRY_MAGIC = 0x54454C4D  # "TELM"
 TELEMETRY_VERSION = 1
 OFF_TELEMETRY_BASE = 256
 MAX_PATH_POINTS = 64
+MAX_WAYPOINTS = 16
 
 # Format strings:
 # Header: Magic(I), Version(I), Enabled(I), Step(I), TgtX(d), TgtY(d), TgtZ(d),
@@ -24,6 +25,11 @@ MAX_PATH_POINTS = 64
 #         CkptSteps(I), CkptPLoss(f), CkptVLoss(f), CkptSuccess(f)
 HEADER_FMT = "<IIII ddd fff fff f I 12f i I I I I fff"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
+# Multi-waypoint trailer (104 bytes, fits within 1024-byte telemetry read window):
+# activeTargetIdx(H), totalTargets(H), targetsReached(H), compassOccluded(B), reserved(B), waypoints(16*3*h)
+WAYPOINT_META_FMT = "<HHHBB"
+WAYPOINT_META_SIZE = struct.calcsize(WAYPOINT_META_FMT)
+BASE_TELEMETRY_SIZE = HEADER_SIZE + MAX_PATH_POINTS * 3 * 2 * 2  # 916 bytes
 
 
 class InferenceTelemetry:
@@ -53,7 +59,12 @@ class InferenceTelemetry:
         checkpoint_policy_loss: float = 0.0,
         checkpoint_value_loss: float = 0.0,
         checkpoint_success_rate: float = 0.0,
-        checkpoint_loss: Optional[float] = None
+        checkpoint_loss: Optional[float] = None,
+        waypoints: Optional[List[Tuple[int, int, int]]] = None,
+        active_target_idx: int = 0,
+        total_targets: int = 0,
+        targets_reached: int = 0,
+        compass_occluded: bool = False,
     ) -> bytes:
         """Packs inference telemetry into byte buffer for MMF Page 0."""
         # Resolve aliases
@@ -102,19 +113,38 @@ class InferenceTelemetry:
         # To avoid overflow, clamp to int16 range [-32768..32767]
         trail_coords = bytearray(MAX_PATH_POINTS * 3 * 2)
         for i, (wx, wy, wz) in enumerate(trail):
-            dx = max(-32000, min(32000, wx - player_pos[0]))
-            dy = max(-32000, min(32000, wy - player_pos[1]))
-            dz = max(-32000, min(32000, wz - player_pos[2]))
+            dx = int(round(max(-32000, min(32000, wx - player_pos[0]))))
+            dy = int(round(max(-32000, min(32000, wy - player_pos[1]))))
+            dz = int(round(max(-32000, min(32000, wz - player_pos[2]))))
             struct.pack_into("<hhh", trail_coords, i * 6, dx, dy, dz)
 
         bfs_coords = bytearray(MAX_PATH_POINTS * 3 * 2)
         for i, (wx, wy, wz) in enumerate(bfs):
-            dx = max(-32000, min(32000, wx - player_pos[0]))
-            dy = max(-32000, min(32000, wy - player_pos[1]))
-            dz = max(-32000, min(32000, wz - player_pos[2]))
+            dx = int(round(max(-32000, min(32000, wx - player_pos[0]))))
+            dy = int(round(max(-32000, min(32000, wy - player_pos[1]))))
+            dz = int(round(max(-32000, min(32000, wz - player_pos[2]))))
             struct.pack_into("<hhh", bfs_coords, i * 6, dx, dy, dz)
 
-        return header_bytes + bytes(trail_coords) + bytes(bfs_coords)
+        # Pack optional multi-waypoint trailer (104 bytes)
+        wp_list = waypoints[:MAX_WAYPOINTS] if waypoints is not None else [(int(round(rel[0])), int(round(rel[1])), int(round(rel[2])))]
+        tot_tgts = int(total_targets) if total_targets > 0 else len(wp_list)
+        tot_tgts = min(MAX_WAYPOINTS, max(0, tot_tgts))
+        wp_meta = struct.pack(
+            WAYPOINT_META_FMT,
+            int(max(0, active_target_idx)),
+            int(tot_tgts),
+            int(max(0, targets_reached)),
+            1 if compass_occluded else 0,
+            0,
+        )
+        wp_coords = bytearray(MAX_WAYPOINTS * 3 * 2)
+        for i, (wx, wy, wz) in enumerate(wp_list[:MAX_WAYPOINTS]):
+            dx = int(round(max(-32000, min(32000, wx - player_pos[0]))))
+            dy = int(round(max(-32000, min(32000, wy - player_pos[1]))))
+            dz = int(round(max(-32000, min(32000, wz - player_pos[2]))))
+            struct.pack_into("<hhh", wp_coords, i * 6, dx, dy, dz)
+
+        return header_bytes + bytes(trail_coords) + bytes(bfs_coords) + wp_meta + bytes(wp_coords)
 
     @staticmethod
     def unpack(data: bytes) -> Optional[Dict[str, Any]]:
@@ -159,6 +189,27 @@ class InferenceTelemetry:
             dx, dy, dz = struct.unpack_from("<hhh", data, offset + i * 6)
             bfs_points.append([dx, dy, dz])
 
+        # Unpack optional multi-waypoint trailer
+        active_target_idx = 0
+        total_targets = 1
+        targets_reached = 0
+        compass_occluded = False
+        waypoints = [[round(tgt_dx, 2), round(tgt_dy, 2), round(tgt_dz, 2)]]
+
+        trailer_offset = BASE_TELEMETRY_SIZE
+        if len(data) >= trailer_offset + WAYPOINT_META_SIZE:
+            act_idx, tot_tgts, tgts_reached, occ_flag, _ = struct.unpack_from(WAYPOINT_META_FMT, data, trailer_offset)
+            if 0 < tot_tgts <= MAX_WAYPOINTS and len(data) >= trailer_offset + WAYPOINT_META_SIZE + tot_tgts * 6:
+                active_target_idx = int(act_idx)
+                total_targets = int(tot_tgts)
+                targets_reached = int(tgts_reached)
+                compass_occluded = bool(occ_flag)
+                wp_offset = trailer_offset + WAYPOINT_META_SIZE
+                waypoints = []
+                for i in range(total_targets):
+                    dx, dy, dz = struct.unpack_from("<hhh", data, wp_offset + i * 6)
+                    waypoints.append([dx, dy, dz])
+
         return {
             "step": step,
             "targetPos": [tgt_x, tgt_y, tgt_z],
@@ -173,6 +224,11 @@ class InferenceTelemetry:
             "lBfs": l_bfs,
             "trailPoints": trail_points,
             "bfsPoints": bfs_points,
+            "activeTargetIdx": active_target_idx,
+            "totalTargets": total_targets,
+            "targetsReached": targets_reached,
+            "compassOccluded": compass_occluded,
+            "waypoints": waypoints,
             "checkpoint": {
                 "steps": ckpt_steps,
                 "policyLoss": round(ckpt_ploss, 4),

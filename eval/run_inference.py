@@ -99,11 +99,14 @@ def run_inference_episode(
 
     player_pos = getattr(env, "player_pos", getattr(env, "pos", np.array([0, 64, 0])))
     target_pos = getattr(env, "target_pos", getattr(env, "active_waypoint", (0, 64, 10)))
+    all_targets_init = list(getattr(env, "targets", [target_pos]))
     optimal_path = getattr(env, "optimal_path", [])
     l_ref = getattr(env, "shortest_path_len", 10.0)
 
     print("\n=======================================================")
-    print(f"Episode Started! Spawn: {tuple(player_pos)} -> Target: {tuple(target_pos)}")
+    print(f"Episode Started! Spawn: {tuple(player_pos)} -> Target: {tuple(target_pos)} ({len(all_targets_init)} waypoint(s))")
+    if len(all_targets_init) > 1:
+        print(f"Waypoints: {[tuple(int(v) for v in t) for t in all_targets_init]}")
     print(f"Reference Path Length: {l_ref:.1f} blocks | FPS: {fps}")
     print("Streaming live frames to 3D WebGL visualizer...")
     print("Controls: [SPACE]=Pause/Resume | [N]=Step | [R]=Reset | [Q]=Quit")
@@ -118,6 +121,62 @@ def run_inference_episode(
     paused = step_pause
     done = False
     last_info: Dict[str, Any] = {}
+
+    def _emit_current_frame(
+        curr_p: Any,
+        reward_val: float,
+        ret_val: float,
+        step_idx: int,
+        v_val: float,
+        probs: List[float],
+        chosen_act: int,
+    ) -> None:
+        if not hasattr(env, "extractor"):
+            return
+        tgt = tuple(getattr(env, "target_pos", getattr(env, "active_waypoint", target_pos)))
+        curr_bfs = [tuple(p) for p in getattr(env, "optimal_path", bfs_tuples)]
+        all_targets = list(getattr(env, "targets", [tgt]))
+        t_idx = int(getattr(env, "target_idx", 0))
+        t_reached = int(getattr(env, "targets_reached", 0))
+        occluded = bool(getattr(env, "compass_occluded", False))
+
+        dist_val = float(np.linalg.norm(np.array(curr_p, dtype=float) - np.array(tgt, dtype=float)))
+        w_dx = float(tgt[0] - curr_p[0])
+        w_dy = float(tgt[1] - curr_p[1])
+        w_dz = float(tgt[2] - curr_p[2])
+        bc_rel = [(p[0] - curr_p[0], p[1] - curr_p[1], p[2] - curr_p[2]) for p in breadcrumbs]
+        bfs_rel = [(p[0] - curr_p[0], p[1] - curr_p[1], p[2] - curr_p[2]) for p in curr_bfs[:64]]
+        wps_rel = [
+            (int(round(t[0] - curr_p[0])), int(round(t[1] - curr_p[1])), int(round(t[2] - curr_p[2])))
+            for t in all_targets[:16]
+        ]
+        telem = InferenceTelemetry.pack(
+            target_pos=(tgt[0], tgt[1], tgt[2]),
+            world_delta=(w_dx, w_dy, w_dz),
+            target_dist=dist_val,
+            step_reward=float(reward_val),
+            episode_return=float(ret_val),
+            step_count=step_idx,
+            critic_value=v_val,
+            action_probabilities=probs,
+            chosen_action=chosen_act,
+            l_bfs=int(round(l_ref)),
+            breadcrumbs=bc_rel,
+            optimal_path=bfs_rel,
+            checkpoint_loss=float(checkpoint_meta.get("loss", 0.0) if checkpoint_meta else 0.0),
+            waypoints=wps_rel,
+            active_target_idx=t_idx,
+            total_targets=len(all_targets),
+            targets_reached=t_reached,
+            compass_occluded=occluded,
+        )
+        c_str = getattr(env, "cardinal", "SOUTH")
+        f_idx = getattr(env, "foot_index", 6)
+        raw_v = env.extractor.extract_observation(tuple(curr_p), c_str, foot_index=f_idx)
+        emitter.emit_observation(raw_v, game_tick=step_idx, telemetry_bytes=telem)
+
+    # Emit initial spawn + target frame immediately (so --pause or slow JIT still shows target)
+    _emit_current_frame(player_pos, 0.0, 0.0, 0, 0.0, [0.0] * 12, 11)
 
     while not done:
         # Check non-blocking keyboard controls
@@ -184,42 +243,7 @@ def run_inference_episode(
         # 4. Pack and Emit Inference Telemetry
         target_tuple = tuple(getattr(env, "target_pos", getattr(env, "active_waypoint", target_pos)))
         d_curr = float(np.linalg.norm(np.array(curr_player) - np.array(target_tuple)))
-
-        # Relative world delta for 3D visualizer beacon
-        world_dx = float(target_tuple[0] - curr_player[0])
-        world_dy = float(target_tuple[1] - curr_player[1])
-        world_dz = float(target_tuple[2] - curr_player[2])
-
-        # Relative path points for 3D visualizer
-        bc_rel = [(p[0] - curr_player[0], p[1] - curr_player[1], p[2] - curr_player[2]) for p in breadcrumbs]
-        bfs_rel = [(p[0] - curr_player[0], p[1] - curr_player[1], p[2] - curr_player[2]) for p in bfs_tuples[:64]]
-
-        telem_bytes = InferenceTelemetry.pack(
-            target_pos=(target_tuple[0], target_tuple[1], target_tuple[2]),
-            world_delta=(world_dx, world_dy, world_dz),
-            target_dist=d_curr,
-            step_reward=float(reward),
-            episode_return=float(ep_return),
-            critic_value=v_est,
-            action_probabilities=list(action_probs),
-            breadcrumbs=bc_rel,
-            optimal_path=bfs_rel,
-            checkpoint_loss=float(checkpoint_meta.get("loss", 0.0) if checkpoint_meta else 0.0),
-        )
-
-        # Emit raw observation to MMF slot
-        cardinal_str = getattr(env, "cardinal", "SOUTH")
-        foot_idx = getattr(env, "foot_index", 6)
-        yaw_val = getattr(env, "yaw", 0.0)
-        pitch_val = getattr(env, "camera_pitch", getattr(env, "pitch", 0.0))
-
-        if hasattr(env, "extractor"):
-            raw_view = env.extractor.extract_observation(tuple(curr_player), cardinal_str, foot_index=foot_idx)
-            emitter.emit_observation(
-                raw_view,
-                game_tick=step_count,
-                telemetry_bytes=telem_bytes,
-            )
+        _emit_current_frame(curr_player, float(reward), float(ep_return), step_count, v_est, list(action_probs), action)
 
         act_name = ACTION_NAMES[action] if action < len(ACTION_NAMES) else f"ACT_{action}"
         print(
@@ -253,6 +277,11 @@ def main():
     parser.add_argument("--greedy", action="store_true", default=True, help="Take deterministic argmax action")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "gpu", "cpu"], help="Target acceleration device (auto, gpu, cpu)")
+    parser.add_argument("--task", type=str, default="rl1", choices=["rl1", "rl2"], help="Navigation task mode: rl1 (single target) or rl2 (5-target chained)")
+    parser.add_argument("--num_targets", type=int, default=None, help="Number of chained waypoints per episode (defaults: 1 for rl1, 5 for rl2)")
+    parser.add_argument("--max_steps", type=int, default=None, help="Max steps per episode (defaults: 150 for rl1, 600 for rl2)")
+    parser.add_argument("--compass_occlusion", type=float, default=None, help="Compass burst occlusion probability (defaults: 0.0 for rl1, 0.5 for rl2)")
+    parser.add_argument("--occlusion_burst_len", type=int, default=6, help="Compass occlusion burst length in ticks")
 
     args = parser.parse_args()
 
@@ -307,13 +336,23 @@ def main():
         checkpoint_meta = load_checkpoint(args.policy_ckpt, policy)
 
     # 3. Instantiate Environment
+    num_targets = args.num_targets if args.num_targets is not None else (5 if args.task == "rl2" else 1)
+    max_steps = args.max_steps if args.max_steps is not None else (600 if args.task == "rl2" else 150)
+    compass_occlusion = args.compass_occlusion if args.compass_occlusion is not None else (0.5 if args.task == "rl2" else 0.0)
+
     if os.path.exists(args.region_dir):
-        print(f"Loading MinecraftNavEnv from {args.region_dir}...")
-        env = MinecraftNavEnv(region_dir=args.region_dir)
+        print(f"Loading MinecraftNavEnv from {args.region_dir} (task={args.task}, targets={num_targets}, max_steps={max_steps}, occlusion={compass_occlusion})...")
+        env = MinecraftNavEnv(
+            region_dir=args.region_dir,
+            max_steps=max_steps,
+            num_targets=num_targets,
+            compass_occlusion_prob=compass_occlusion,
+            occlusion_burst_len=args.occlusion_burst_len,
+        )
     else:
         print(f"Region dir '{args.region_dir}' not found. Using debug bridge course...")
         vol, start, wps = make_debug_bridge_course(seed=args.seed)
-        env = VoxelNavEnv(volume=vol, start=start, waypoints=wps)
+        env = VoxelNavEnv(volume=vol, start=start, waypoints=wps, max_steps=max_steps)
 
     # 4. IPC Emitter
     emitter = MinecraftIpcEmitter()

@@ -521,3 +521,94 @@ class LodExtractor:
             shells[lod, ..., 13] = b["visibility"]
             shells[lod, ..., 14] = np.clip(b["hardness"] / 50.0, 0.0, 1.0)
         return shells, obs["header"]
+
+
+def extract_uniform32_16ch(
+    world: WorldVolume,
+    palette: BlockPalette,
+    player_pos: Tuple[int, int, int],
+    cardinal: str = "SOUTH",
+    camera_pitch: float = 0.0,
+    as_uint8: bool = True,
+) -> np.ndarray:
+    """Extract a true 1x-resolution (32, 32, 32, 16) voxel volume matching LOD-1's 32^3 bounds.
+
+    Spatial bounds relative to player_pos (stride=1):
+      - lateral (lx): [-16, +15]
+      - vertical (ly): [(0 - foot_idx)*2, (16 - foot_idx)*2 - 1]
+      - forward (lz): [-4, +27]
+    """
+    from data.schema import Channel
+
+    px, py, pz = int(player_pos[0]), int(player_pos[1]), int(player_pos[2])
+    foot_idx = calculate_foot_index(camera_pitch)
+
+    lx_ext = np.arange(-17, 17)  # padded by 1 on each side -> 34
+    ly_ext = np.arange((0 - foot_idx) * 2 - 1, (16 - foot_idx) * 2 + 1)
+    lz_ext = np.arange(-5, 29)
+
+    if cardinal == "SOUTH":
+        wx_1d, wz_1d = px - lx_ext, pz + lz_ext
+        wx_3d, wy_3d, wz_3d = np.meshgrid(wx_1d, py + ly_ext, wz_1d, indexing="ij")
+    elif cardinal == "NORTH":
+        wx_1d, wz_1d = px + lx_ext, pz - lz_ext
+        wx_3d, wy_3d, wz_3d = np.meshgrid(wx_1d, py + ly_ext, wz_1d, indexing="ij")
+    elif cardinal == "WEST":
+        wx_1d, wz_1d = px - lz_ext, pz - lx_ext
+        wz_3d, wy_3d, wx_3d = np.meshgrid(wz_1d, py + ly_ext, wx_1d, indexing="ij")
+    else:  # EAST
+        wx_1d, wz_1d = px + lz_ext, pz + lx_ext
+        wz_3d, wy_3d, wx_3d = np.meshgrid(wz_1d, py + ly_ext, wx_1d, indexing="ij")
+
+    raw_padded = world.query_coordinates(wx_3d, wy_3d, wz_3d)  # (34, 34, 34)
+    block_id = raw_padded[1:-1, 1:-1, 1:-1]
+
+    vol = np.zeros((32, 32, 32, 16), dtype=np.float32)
+    occ = palette.lut_is_solid[block_id].astype(np.float32)
+    passab = palette.lut_passability[block_id]
+
+    vol[..., Channel.TERRAIN] = occ
+    vol[..., Channel.AIR] = passab
+    vol[..., Channel.HAZARD] = palette.lut_hazard[block_id]
+    vol[..., Channel.LIQUID] = palette.lut_channel_liquid[block_id].astype(np.float32)
+    vol[..., Channel.CLIMBABLE] = palette.lut_channel_climbable[block_id].astype(np.float32)
+    vol[..., Channel.FOLIAGE] = palette.lut_channel_foliage[block_id].astype(np.float32)
+
+    gy_vals = py + ly_ext[1:-1]
+    norm_y = np.clip((gy_vals - (-64.0)) / 384.0, 0.0, 1.0).astype(np.float32)
+    vol[:, :, :, Channel.WORLD_Y] = norm_y[None, :, None]
+
+    vol[..., Channel.COLLISION_HEIGHT] = palette.lut_collision_height[block_id]
+    vol[..., Channel.RESOURCE] = palette.lut_channel_resource[block_id].astype(np.float32)
+
+    walkable = np.zeros_like(occ)
+    walkable[:, :-1, :] = (occ[:, :-1, :] > 0.5) & (passab[:, 1:, :] > 0.5)
+    vol[..., Channel.WALKABLE_SURFACE] = walkable
+    vol[..., Channel.LIGHT_LEVEL] = (palette.lut_luminance[block_id] / 15.0).astype(np.float32)
+
+    drop = np.zeros_like(passab)
+    drop[:, 3:, :] = (
+        (passab[:, 3:, :] > 0.5)
+        & (passab[:, 2:-1, :] > 0.5)
+        & (passab[:, 1:-2, :] > 0.5)
+        & (passab[:, :-3, :] > 0.5)
+    )
+    vol[..., Channel.LETHAL_DROP] = drop
+
+    is_opaque = palette.lut_is_opaque[raw_padded]
+    fully_enclosed = (
+        is_opaque[1:-1, 2:, 1:-1]
+        & is_opaque[1:-1, :-2, 1:-1]
+        & is_opaque[:-2, 1:-1, 1:-1]
+        & is_opaque[2:, 1:-1, 1:-1]
+        & is_opaque[1:-1, 1:-1, 2:]
+        & is_opaque[1:-1, 1:-1, :-2]
+    )
+    vis = np.ones_like(occ)
+    vis[(occ == 1.0) & fully_enclosed] = 0.0
+    vol[..., Channel.SURFACE_SHELL] = vis
+    vol[..., Channel.BLOCK_HARDNESS] = np.clip(palette.lut_hardness[block_id] / 50.0, 0.0, 1.0)
+
+    if as_uint8:
+        return np.clip(vol * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return vol

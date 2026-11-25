@@ -5,6 +5,7 @@ Strictly follows docs/TRAIN_CONTRACT.md.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 import shutil
@@ -27,12 +28,17 @@ class ProgressBar:
         bar_len: int = 24,
         log_every: int = 5,
         is_tty: Optional[bool] = None,
+        log_file: Optional[str] = None,
+        process_tag: Optional[str] = None,
     ):
         self.total = max(1, total)
         self.prefix = prefix
         self.bar_len = bar_len
         self.log_every = max(1, log_every)
         self.is_tty = sys.stdout.isatty() if is_tty is None else is_tty
+        self.log_file = log_file
+        self.pid = os.getpid()
+        self.process_tag = process_tag or f"PID {self.pid}"
         self.start_time = time.time()
         self._last_line_len = 0
 
@@ -46,6 +52,19 @@ class ProgressBar:
             return f"{m:02d}m{s:02d}s"
         h, m = divmod(m, 60)
         return f"{h:d}h{m:02d}m"
+
+    def _append_to_file(self, line: str) -> None:
+        """Append log line to log_file if path is specified."""
+        if not self.log_file:
+            return
+        try:
+            parent = os.path.dirname(os.path.abspath(self.log_file))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(line.strip() + "\n")
+        except Exception:
+            pass
 
     def update(self, current: int, metrics: Optional[Dict[str, Any]] = None):
         """Update progress bar display with current step and metrics dict."""
@@ -61,6 +80,7 @@ class ProgressBar:
         time_str = f"{rate:5.2f}s/step" if rate >= 1.0 else f"{1.0 / max(rate, 1e-4):5.1f}step/s"
         eta_str = self._format_time(remaining)
         elap_str = self._format_time(elapsed)
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         metric_parts = []
         if metrics and is_periodic:
@@ -96,16 +116,18 @@ class ProgressBar:
             if is_periodic and current < self.total:
                 # Clear active bar line and print permanent mini-log line
                 sys.stdout.write("\r" + " " * clear_width + "\r")
-                mini_log = f"  [{self.prefix.strip()} | Step {step_str}] {metrics_str} | {time_str} | Elapsed: {elap_str} | ETA: {eta_str}"
+                mini_log = f"[{now_ts}] [{self.process_tag}] [{self.prefix.strip()} | Step {step_str}] {metrics_str} | {time_str} | Elapsed: {elap_str} | ETA: {eta_str}"
                 sys.stdout.write(mini_log + "\n")
+                self._append_to_file(mini_log)
                 sys.stdout.write(status[: cols - 1])
                 sys.stdout.flush()
                 self._last_line_len = len(status[: cols - 1])
             elif current == self.total:
                 # Finished: clear bar line and print final summary mini-log
                 sys.stdout.write("\r" + " " * clear_width + "\r")
-                mini_log = f"  [{self.prefix.strip()} | Step {step_str}] {metrics_str} | {time_str} | Elapsed: {elap_str}"
+                mini_log = f"[{now_ts}] [{self.process_tag}] [{self.prefix.strip()} | Step {step_str}] {metrics_str} | {time_str} | Elapsed: {elap_str}"
                 sys.stdout.write(mini_log + "\n")
+                self._append_to_file(mini_log)
                 sys.stdout.flush()
                 self._last_line_len = 0
             else:
@@ -115,8 +137,9 @@ class ProgressBar:
         else:
             # Non-TTY mode (e.g. redirected output, CI, background log)
             if is_periodic or current == 1:
-                line = f"  [{self.prefix.strip()} | Step {step_str}] ({fraction * 100:4.1f}%) | {time_str} | Elapsed: {elap_str} | ETA: {eta_str} | {metrics_str}"
+                line = f"[{now_ts}] [{self.process_tag}] [{self.prefix.strip()} | Step {step_str}] ({fraction * 100:4.1f}%) | {time_str} | Elapsed: {elap_str} | ETA: {eta_str} | {metrics_str}"
                 print(line, flush=True)
+                self._append_to_file(line)
 
 
 
@@ -167,6 +190,10 @@ def append_metrics_jsonl(path: str, record: Dict[str, Any]) -> None:
         return v
 
     clean_record = {k: _serialize(v) for k, v in record.items()}
+    if "timestamp" not in clean_record:
+        clean_record["timestamp"] = datetime.now(timezone.utc).isoformat()
+    if "pid" not in clean_record:
+        clean_record["pid"] = os.getpid()
 
     parent_dir = os.path.dirname(os.path.abspath(path))
     if parent_dir:

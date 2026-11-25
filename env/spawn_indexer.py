@@ -235,14 +235,58 @@ class SpawnSampler:
         )
 
     @classmethod
-    def from_npz(cls, npz_path: str, weights: Tuple[float, float, float] = (0.60, 0.25, 0.15)) -> "SpawnSampler":
-        with np.load(npz_path) as data:
-            return cls(
-                surface_spawns=data["surface"],
-                subterranean_spawns=data["subterranean"],
-                steep_spawns=data["steep"],
-                weights=weights
+    def from_npz(
+        cls,
+        npz_path: Union[str, List[str]],
+        weights: Tuple[float, float, float] = (0.60, 0.25, 0.15),
+    ) -> "SpawnSampler":
+        paths = [npz_path] if isinstance(npz_path, str) else list(npz_path)
+        surf_l, sub_l, steep_l = [], [], []
+        for p in paths:
+            with np.load(p) as data:
+                if len(data["surface"]) > 0:
+                    surf_l.append(data["surface"])
+                if len(data["subterranean"]) > 0:
+                    sub_l.append(data["subterranean"])
+                if len(data["steep"]) > 0:
+                    steep_l.append(data["steep"])
+        empty = np.zeros((0, 3), dtype=np.int32)
+        return cls(
+            surface_spawns=np.vstack(surf_l) if surf_l else empty,
+            subterranean_spawns=np.vstack(sub_l) if sub_l else empty,
+            steep_spawns=np.vstack(steep_l) if steep_l else empty,
+            weights=weights,
+        )
+
+    def filter_interior_margin(
+        self,
+        min_x: int,
+        max_x: int,
+        min_z: int,
+        max_z: int,
+        margin: int = 64,
+    ) -> None:
+        """Restrict spawns to >= margin blocks inside world bounds so LOD-2 avoids unloaded air."""
+        if (max_x - min_x) <= 2 * margin or (max_z - min_z) <= 2 * margin:
+            return
+
+        def _clip_pool(arr: np.ndarray) -> np.ndarray:
+            if len(arr) == 0:
+                return arr
+            m = (
+                (arr[:, 0] >= min_x + margin)
+                & (arr[:, 0] <= max_x - margin)
+                & (arr[:, 2] >= min_z + margin)
+                & (arr[:, 2] <= max_z - margin)
             )
+            return arr[m]
+
+        f_surf = _clip_pool(self.surface)
+        f_sub = _clip_pool(self.subterranean)
+        f_steep = _clip_pool(self.steep)
+        if len(f_surf) + len(f_sub) + len(f_steep) > 0:
+            self.surface, self.subterranean, self.steep = f_surf, f_sub, f_steep
+            self.pools = [self.surface, self.subterranean, self.steep]
 
     def sample(self, rng: Optional[np.random.Generator] = None) -> Tuple[int, int, int]:
         """Samples a single (wx, wy, wz) spawn point according to curriculum weights."""

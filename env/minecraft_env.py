@@ -65,33 +65,59 @@ class MinecraftNavEnv:
         spawns_path: Optional[str] = None,
         palette_obj: Optional[BlockPalette] = None,
         curriculum: Optional[DistanceCurriculumScheduler] = None,
-        max_steps: int = 250,
+        max_steps: Optional[int] = None,
         goal_reach_radius: float = 1.5,
         mask_fatal: bool = True,
-        render_mode: Optional[str] = None
+        render_mode: Optional[str] = None,
+        num_targets: int = 1,
+        compass_occlusion_prob: float = 0.0,
+        occlusion_burst_len: int = 6,
+        flash_compass_ticks: int = 0,
+        skip_shells: bool = False,
     ) -> None:
         self.region_dir = region_dir
         self.palette = palette_obj or get_palette()
         self.world = WorldVolume(region_dir, palette_obj=self.palette)
 
         if spawns_path is None:
-            candidates = glob.glob(os.path.join(region_dir, "*.spawns.npz"))
-            if candidates:
-                spawns_path = candidates[0]
-            else:
-                spawns_path = None
-
-        if spawns_path and os.path.exists(spawns_path):
-            self.spawn_sampler = SpawnSampler.from_npz(spawns_path)
+            candidates = sorted(glob.glob(os.path.join(region_dir, "*.spawns.npz")))
         else:
-            self.spawn_sampler = None
+            candidates = [spawns_path] if os.path.exists(spawns_path) else []
+
+        if not candidates:
+            raise FileNotFoundError(
+                f"No '*.spawns.npz' files found in region_dir '{region_dir}'. "
+                f"Precompute traversable spawns first using: "
+                f"uv run python -m env.spawn_indexer --region_dir \"{region_dir}\""
+            )
+
+        self.spawn_sampler = SpawnSampler.from_npz(candidates)
+        if self.world.regions:
+            rxs = [rx for rx, _ in self.world.regions.keys()]
+            rzs = [rz for _, rz in self.world.regions.keys()]
+            self.spawn_sampler.filter_interior_margin(
+                min_x=min(rxs) * 512,
+                max_x=(max(rxs) + 1) * 512 - 1,
+                min_z=min(rzs) * 512,
+                max_z=(max(rzs) + 1) * 512 - 1,
+                margin=64,
+            )
 
         self.extractor = LodExtractor(self.world, self.palette)
         self.kernel = MovementPhysicsKernel(self.world, self.palette)
         self.target_gen = BoundedBfsTargetGenerator(self.kernel)
         self.curriculum = curriculum or DistanceCurriculumScheduler()
 
-        self.max_steps = max_steps
+        self.num_targets = max(1, int(num_targets))
+        self.compass_occlusion_prob = float(compass_occlusion_prob)
+        self.occlusion_burst_len = max(1, int(occlusion_burst_len))
+        self.flash_compass_ticks = max(0, int(flash_compass_ticks))
+        self.skip_shells = bool(skip_shells)
+        if max_steps is None:
+            self.max_steps = 600 if self.num_targets > 1 else 250
+        else:
+            self.max_steps = int(max_steps)
+
         self.goal_reach_radius = goal_reach_radius
         self.mask_fatal = mask_fatal
         self.render_mode = render_mode
@@ -104,13 +130,23 @@ class MinecraftNavEnv:
         self.player_pos = np.array([0, 64, 0], dtype=int)
         self.prev_pos = np.copy(self.player_pos)
         self.target_pos = np.array([0, 64, 10], dtype=int)
+        self.targets: List[np.ndarray] = [self.target_pos]
+        self.target_paths: List[List[Tuple[int, int, int]]] = []
+        self.target_idx = 0
+        self.targets_reached = 0
+        self._target_reach_steps: List[int] = []
         self.optimal_path: List[Tuple[int, int, int]] = []
         self.shortest_path_len = 10.0
+
+        self.compass_occluded = False
+        self._occlusion_phase = 0
+        self._occlusion_rng = np.random.default_rng()
 
         self.cardinal = "SOUTH"
         self.yaw = 0.0
         self.camera_pitch = 0.0
         self.step_count = 0
+        self._leg_step_count = 0
         self.prev_action = 11  # Stay / Idle
         self.path_length = 0.0
 
@@ -238,34 +274,45 @@ class MinecraftNavEnv:
             shells[lod, ..., Channel.OUT_OF_BOUNDS] = 0.0
 
             # Channel 8: WAYPOINT Beacon Injection
-            # Project target_pos into egocentric grid coordinates for this LOD
-            dx_w = self.target_pos[0] - self.player_pos[0]
-            dy_w = self.target_pos[1] - self.player_pos[1]
-            dz_w = self.target_pos[2] - self.player_pos[2]
-
+            # Project active target (and remaining unreached targets in RL2) into egocentric grid coordinates
             fwd_v = CARDINAL_VECTORS[self.cardinal]["forward"]
             right_v = CARDINAL_VECTORS[self.cardinal]["right"]
 
-            # Rotate world delta to ego delta
-            ego_x = dx_w * right_v[0] + dz_w * right_v[1]
-            ego_z = dx_w * fwd_v[0] + dz_w * fwd_v[1]
-            ego_y = dy_w
+            remaining_targets = self.targets[self.target_idx :] if self.targets else [self.target_pos]
+            # Write future targets first (0.5) so active target (1.0) always takes precedence
+            for offset_idx in range(len(remaining_targets) - 1, -1, -1):
+                tgt = remaining_targets[offset_idx]
+                beacon_val = 1.0 if offset_idx == 0 else 0.5
 
-            # Map ego metric delta to grid cell
-            gx = int(round(8 + ego_x / stride))
-            gy = int(round(foot_idx + ego_y / stride))
-            gz = int(round(2 + ego_z / stride))
+                dx_w = tgt[0] - self.player_pos[0]
+                dy_w = tgt[1] - self.player_pos[1]
+                dz_w = tgt[2] - self.player_pos[2]
 
-            if 0 <= gx < 16 and 0 <= gz < 16:
-                y_min = max(0, gy - 2)
-                y_max = min(16, gy + 4)
-                if y_min < y_max:
-                    shells[lod, gx, y_min:y_max, gz, Channel.WAYPOINT] = 1.0
+                ego_x = dx_w * right_v[0] + dz_w * right_v[1]
+                ego_z = dx_w * fwd_v[0] + dz_w * fwd_v[1]
+                ego_y = dy_w
+
+                gx = int(round(8 + ego_x / stride))
+                gy = int(round(foot_idx + ego_y / stride))
+                gz = int(round(2 + ego_z / stride))
+
+                if 0 <= gx < 16 and 0 <= gz < 16:
+                    y_min = max(0, gy - 2)
+                    y_max = min(16, gy + 4)
+                    if y_min < y_max:
+                        shells[lod, gx, y_min:y_max, gz, Channel.WAYPOINT] = np.maximum(
+                            shells[lod, gx, y_min:y_max, gz, Channel.WAYPOINT],
+                            beacon_val,
+                        )
 
         return shells
 
     def _get_obs(self) -> Dict[str, np.ndarray]:
-        shells = self._extract_16ch_shells()
+        shells = (
+            np.zeros(SHELL_VOXEL_SHAPE, dtype=np.float32)
+            if self.skip_shells
+            else self._extract_16ch_shells()
+        )
 
         dx, dy, dz = (self.player_pos - self.prev_pos).astype(np.float32)
         yaw_rad = math.radians(self.yaw)
@@ -282,19 +329,22 @@ class MinecraftNavEnv:
             grounded
         ], dtype=np.float32)
 
-        # Egocentric 3D relative goal vector
-        dx_w = self.target_pos[0] - self.player_pos[0]
-        dy_w = self.target_pos[1] - self.player_pos[1]
-        dz_w = self.target_pos[2] - self.player_pos[2]
+        # Egocentric 3D relative goal vector (with optional occlusion for RL2/RL3/RL4)
+        if self.compass_occluded:
+            goal_vec = np.zeros(3, dtype=np.float32)
+        else:
+            dx_w = self.target_pos[0] - self.player_pos[0]
+            dy_w = self.target_pos[1] - self.player_pos[1]
+            dz_w = self.target_pos[2] - self.player_pos[2]
 
-        fwd_v = CARDINAL_VECTORS[self.cardinal]["forward"]
-        right_v = CARDINAL_VECTORS[self.cardinal]["right"]
+            fwd_v = CARDINAL_VECTORS[self.cardinal]["forward"]
+            right_v = CARDINAL_VECTORS[self.cardinal]["right"]
 
-        ego_gx = float(dx_w * right_v[0] + dz_w * right_v[1])
-        ego_gz = float(dx_w * fwd_v[0] + dz_w * fwd_v[1])
-        ego_gy = float(dy_w)
+            ego_gx = float(dx_w * right_v[0] + dz_w * right_v[1])
+            ego_gz = float(dx_w * fwd_v[0] + dz_w * fwd_v[1])
+            ego_gy = float(dy_w)
 
-        goal_vec = np.array([ego_gx, ego_gy, ego_gz], dtype=np.float32)
+            goal_vec = np.array([ego_gx, ego_gy, ego_gz], dtype=np.float32)
         action_mask = self._build_action_mask()
 
         return {
@@ -308,11 +358,7 @@ class MinecraftNavEnv:
         rng = np.random.default_rng(seed)
 
         # 1. Sample spawn position
-        if self.spawn_sampler is not None:
-            spawn_coord = self.spawn_sampler.sample(rng=rng)
-        else:
-            spawn_coord = (0, 64, 0)
-
+        spawn_coord = self.spawn_sampler.sample(rng=rng)
         self.player_pos = np.array(spawn_coord, dtype=int)
         self.prev_pos = np.copy(self.player_pos)
 
@@ -321,34 +367,99 @@ class MinecraftNavEnv:
         self.yaw = CARDINAL_YAW_DEG[self.cardinal]
         self.camera_pitch = 0.0
         self.step_count = 0
+        self._leg_step_count = 0
         self.path_length = 0.0
         self.prev_action = 11
 
-        # 3. Generate reachable BFS target within curriculum distance
-        dist_range = self.curriculum.get_distance_range()
-        target_coord, l_bfs, path = self.target_gen.generate_target(
-            spawn=tuple(self.player_pos),
-            cardinal=self.cardinal,
-            foot_index=calculate_foot_index(self.camera_pitch),
-            target_dist_range=dist_range,
-            rng=rng
-        )
+        # 3. Generate reachable BFS target(s)
+        foot_idx = calculate_foot_index(self.camera_pitch)
+        if self.num_targets == 1:
+            dist_range = self.curriculum.get_distance_range()
+            target_coord, l_bfs, path = self.target_gen.generate_target(
+                spawn=tuple(self.player_pos),
+                cardinal=self.cardinal,
+                foot_index=foot_idx,
+                target_dist_range=dist_range,
+                rng=rng
+            )
+            self.targets = [np.array(target_coord, dtype=int)]
+            self.target_paths = [path]
+            self.shortest_path_len = max(1.0, float(l_bfs))
+        else:
+            self.targets = []
+            self.target_paths = []
+            curr_anchor = tuple(self.player_pos)
+            visited_targets = {curr_anchor}
+            total_bfs_len = 0.0
+            for t_i in range(self.num_targets):
+                best_coord, best_l, best_path = curr_anchor, 0, [curr_anchor]
+                # Try primary cardinal first, then fallback orientations to avoid dead-ends
+                try_cardinals = [self.cardinal] + [c for c in CARDINAL_ORDER if c != self.cardinal]
+                for try_card in try_cardinals:
+                    t_coord, l_bfs, path = self.target_gen.generate_target(
+                        spawn=curr_anchor,
+                        cardinal=try_card,
+                        foot_index=foot_idx,
+                        target_dist_range=(10, 24),
+                        rng=rng,
+                    )
+                    if l_bfs > 0 and tuple(t_coord) not in visited_targets:
+                        best_coord, best_l, best_path = t_coord, l_bfs, path
+                        break
+                    elif l_bfs > best_l:
+                        best_coord, best_l, best_path = t_coord, l_bfs, path
+                self.targets.append(np.array(best_coord, dtype=int))
+                self.target_paths.append(best_path)
+                visited_targets.add(tuple(best_coord))
+                total_bfs_len += max(1.0, float(best_l))
+                curr_anchor = tuple(best_coord)
+            self.shortest_path_len = max(1.0, total_bfs_len)
 
-        self.target_pos = np.array(target_coord, dtype=int)
-        self.optimal_path = path
-        self.shortest_path_len = max(1.0, float(l_bfs))
+        self.target_idx = 0
+        self.targets_reached = 0
+        self._target_reach_steps = []
+        self.target_pos = self.targets[0]
+        self.optimal_path = self.target_paths[0]
+
+        # 4. Initialize compass occlusion state (RL3/RL4 flash & beacon precedence)
+        self._occlusion_rng = rng
+        if self.flash_compass_ticks > 0:
+            self._occlusion_phase = 0
+            self.compass_occluded = False
+        elif self.compass_occlusion_prob >= 1.0:
+            self._occlusion_phase = 0
+            self.compass_occluded = True
+        elif self.compass_occlusion_prob > 0.0:
+            self._occlusion_phase = int(rng.integers(0, self.occlusion_burst_len))
+            self.compass_occluded = bool(rng.random() < self.compass_occlusion_prob)
+        else:
+            self._occlusion_phase = 0
+            self.compass_occluded = False
 
         return self._get_obs()
 
     def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, Any]]:
+        was_occluded = bool(self.compass_occluded)
         self.step_count += 1
+        self._leg_step_count += 1
         self.prev_pos = np.copy(self.player_pos)
+        prev_yaw = self.yaw
         d_prev = self._distance_to_target()
 
         reward = -0.02  # Time penalty
         collision = False
+        blocked = False
         done = False
         success = False
+
+        # Compute pre-action horizontal heading alignment with target
+        yaw_rad_prev = math.radians(prev_yaw)
+        fwd_prev_x = -math.sin(yaw_rad_prev)
+        fwd_prev_z = math.cos(yaw_rad_prev)
+        dx_t_prev = float(self.target_pos[0] - self.prev_pos[0])
+        dz_t_prev = float(self.target_pos[2] - self.prev_pos[2])
+        norm_t_prev = math.hypot(dx_t_prev, dz_t_prev)
+        cos_prev = (fwd_prev_x * dx_t_prev + fwd_prev_z * dz_t_prev) / (norm_t_prev + 1e-6)
 
         fwd_v = CARDINAL_VECTORS[self.cardinal]["forward"]
         right_v = CARDINAL_VECTORS[self.cardinal]["right"]
@@ -405,9 +516,14 @@ class MinecraftNavEnv:
                 self.player_pos = np.array([nx, ny, nz], dtype=int)
                 step_dist = float(np.linalg.norm(self.player_pos - self.prev_pos))
                 self.path_length += step_dist
+                if np.array_equal(self.player_pos, self.prev_pos):
+                    reward -= 0.15
+                    collision = True
+                    blocked = True
             elif outcome == MoveOutcome.BLOCKED:
-                reward -= 0.1
+                reward -= 0.15
                 collision = True
+                blocked = True
             elif outcome == MoveOutcome.FATAL_HAZARD:
                 reward -= 5.0
                 collision = True
@@ -426,12 +542,32 @@ class MinecraftNavEnv:
         # Potential-based distance shaping: +0.25 * (d_{t-1} - d_t)
         reward += 0.25 * (d_prev - d_curr)
 
+        # Heading-alignment shaping bonus: +0.05 * (cos_after - cos_before)
+        yaw_rad_curr = math.radians(self.yaw)
+        fwd_curr_x = -math.sin(yaw_rad_curr)
+        fwd_curr_z = math.cos(yaw_rad_curr)
+        dx_t_curr = float(self.target_pos[0] - self.player_pos[0])
+        dz_t_curr = float(self.target_pos[2] - self.player_pos[2])
+        norm_t_curr = math.hypot(dx_t_curr, dz_t_curr)
+        cos_curr = (fwd_curr_x * dx_t_curr + fwd_curr_z * dz_t_curr) / (norm_t_curr + 1e-6)
+        reward += 0.05 * (cos_curr - cos_prev)
+
         # Check goal reach (dist <= 1.5 blocks)
         if d_curr <= self.goal_reach_radius:
             reward += 10.0
-            done = True
-            success = True
-            self.curriculum.record_result(True, self.path_length, self.shortest_path_len)
+            self.targets_reached += 1
+            self._target_reach_steps.append(int(self.step_count))
+            self.target_idx += 1
+            if self.target_idx >= len(self.targets):
+                done = True
+                success = True
+                self.curriculum.record_result(True, self.path_length, self.shortest_path_len)
+            else:
+                # Advance to next target in chain without terminating episode or resetting memory.
+                # Reset leg tick counter so RL3/RL4 flash mode grants a fresh compass flash per leg.
+                self._leg_step_count = 0
+                self.target_pos = self.targets[self.target_idx]
+                self.optimal_path = self.target_paths[self.target_idx]
 
         # Timeout check
         if self.step_count >= self.max_steps:
@@ -439,13 +575,30 @@ class MinecraftNavEnv:
             if not success:
                 self.curriculum.record_result(False, self.path_length, self.shortest_path_len)
 
+        # Update compass occlusion state for the next observation
+        if self.flash_compass_ticks > 0:
+            self.compass_occluded = self._leg_step_count >= self.flash_compass_ticks
+        elif self.compass_occlusion_prob >= 1.0:
+            self.compass_occluded = True
+        elif self.compass_occlusion_prob > 0.0:
+            if (self.step_count + self._occlusion_phase) % self.occlusion_burst_len == 0:
+                if abs(self.compass_occlusion_prob - 0.5) < 1e-6:
+                    self.compass_occluded = not self.compass_occluded
+                else:
+                    self.compass_occluded = bool(self._occlusion_rng.random() < self.compass_occlusion_prob)
+
         obs = self._get_obs()
         info = {
             "success": success,
             "path_length": self.path_length,
-            "waypoints_reached": 1 if success else 0,
-            "total_waypoints": 1,
+            "targets_reached": self.targets_reached,
+            "num_targets": self.num_targets,
+            "waypoints_reached": self.targets_reached,
+            "total_waypoints": self.num_targets,
+            "target_reach_steps": list(self._target_reach_steps),
+            "compass_occluded": was_occluded,
             "collision": collision,
+            "blocked": blocked,
             "shortest_path_len": self.shortest_path_len,
             "target_distance": d_curr
         }

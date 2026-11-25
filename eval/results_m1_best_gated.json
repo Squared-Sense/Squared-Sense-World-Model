@@ -1,0 +1,13 @@
+{
+  "success_rate_pct": 100.0,
+  "spl": 1.0,
+  "spl_pct": 100.0,
+  "waypoint_completion_pct": 100.0,
+  "hazard_collision_rate_pct": 0.0,
+  "empirical_mflops_per_step": 49.817142857142855,
+  "latency_ms_per_step": 104.7914945717535,
+  "use_gating": true,
+  "total_episodes": 10,
+  "total_steps": 350,
+  "mean_episode_length": 35.0
+}

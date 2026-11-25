@@ -1,0 +1,324 @@
+{
+  "taus": [
+    0.0,
+    0.01,
+    0.02,
+    0.05,
+    0.1,
+    0.2
+  ],
+  "pareto": [
+    {
+      "tau_gate": 0.0,
+      "sr_pct": 75.0,
+      "spl": 0.6118552874512575,
+      "mean_latent_cosine_vs_dense": 1.0000000018852495,
+      "mean_mflops_per_step": 1526.407253521127,
+      "mean_latency_ms": 249.78298573926583,
+      "shell_skip_pct": [
+        14.964788732394362,
+        14.964788732394362,
+        14.964788732394362
+      ],
+      "transformer_skip_pct": 14.964788732394362,
+      "by_regime": {
+        "idle": {
+          "steps": 0,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "pitch_only": {
+          "steps": 1,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "straight_walk": {
+          "steps": 531,
+          "shell_skip_pct": [
+            1.3182674199623352,
+            1.3182674199623352,
+            1.3182674199623352
+          ],
+          "transformer_skip_pct": 1.3182674199623352
+        },
+        "active_turn": {
+          "steps": 604,
+          "shell_skip_pct": [
+            26.986754966887418,
+            26.986754966887418,
+            26.986754966887418
+          ],
+          "transformer_skip_pct": 26.986754966887418
+        }
+      }
+    },
+    {
+      "tau_gate": 0.01,
+      "sr_pct": 70.0,
+      "spl": 0.574184569610457,
+      "mean_latent_cosine_vs_dense": 0.9991678084194939,
+      "mean_mflops_per_step": 859.5048259385666,
+      "mean_latency_ms": 77.50626785002027,
+      "shell_skip_pct": [
+        61.16040955631399,
+        63.82252559726962,
+        62.45733788395904
+      ],
+      "transformer_skip_pct": 49.829351535836174,
+      "by_regime": {
+        "idle": {
+          "steps": 0,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "pitch_only": {
+          "steps": 0,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "straight_walk": {
+          "steps": 1047,
+          "shell_skip_pct": [
+            74.21203438395415,
+            77.36389684813754,
+            75.26265520534862
+          ],
+          "transformer_skip_pct": 59.69436485195797
+        },
+        "active_turn": {
+          "steps": 418,
+          "shell_skip_pct": [
+            28.4688995215311,
+            29.904306220095695,
+            30.38277511961722
+          ],
+          "transformer_skip_pct": 25.11961722488038
+        }
+      }
+    },
+    {
+      "tau_gate": 0.02,
+      "sr_pct": 65.0,
+      "spl": 0.4634622931821092,
+      "mean_latent_cosine_vs_dense": 0.9968284190109017,
+      "mean_mflops_per_step": 698.9126383526384,
+      "mean_latency_ms": 68.520485199683,
+      "shell_skip_pct": [
+        65.63706563706563,
+        67.76061776061776,
+        67.31016731016732
+      ],
+      "transformer_skip_pct": 60.231660231660236,
+      "by_regime": {
+        "idle": {
+          "steps": 0,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "pitch_only": {
+          "steps": 0,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "straight_walk": {
+          "steps": 937,
+          "shell_skip_pct": [
+            85.6990394877268,
+            89.43436499466382,
+            87.94023479188901
+          ],
+          "transformer_skip_pct": 77.6947705442903
+        },
+        "active_turn": {
+          "steps": 617,
+          "shell_skip_pct": [
+            35.17017828200972,
+            34.84602917341977,
+            35.980551053484604
+          ],
+          "transformer_skip_pct": 33.71150729335494
+        }
+      }
+    },
+    {
+      "tau_gate": 0.05,
+      "sr_pct": 60.0,
+      "spl": 0.4675464707731057,
+      "mean_latent_cosine_vs_dense": 0.9723992949056101,
+      "mean_mflops_per_step": 434.87413407821225,
+      "mean_latency_ms": 61.10249893836073,
+      "shell_skip_pct": [
+        78.10055865921788,
+        83.74301675977654,
+        77.26256983240222
+      ],
+      "transformer_skip_pct": 75.75418994413408,
+      "by_regime": {
+        "idle": {
+          "steps": 0,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "pitch_only": {
+          "steps": 0,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "straight_walk": {
+          "steps": 1112,
+          "shell_skip_pct": [
+            97.12230215827337,
+            97.931654676259,
+            98.38129496402878
+          ],
+          "transformer_skip_pct": 96.40287769784173
+        },
+        "active_turn": {
+          "steps": 678,
+          "shell_skip_pct": [
+            46.902654867256636,
+            60.47197640117994,
+            42.62536873156343
+          ],
+          "transformer_skip_pct": 41.88790560471977
+        }
+      }
+    },
+    {
+      "tau_gate": 0.1,
+      "sr_pct": 65.0,
+      "spl": 0.51271778016138,
+      "mean_latent_cosine_vs_dense": 0.9280505575897928,
+      "mean_mflops_per_step": 297.2074670184697,
+      "mean_latency_ms": 32.76593548821738,
+      "shell_skip_pct": [
+        81.92612137203166,
+        98.68073878627969,
+        98.68073878627969
+      ],
+      "transformer_skip_pct": 81.92612137203166,
+      "by_regime": {
+        "idle": {
+          "steps": 0,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "pitch_only": {
+          "steps": 1,
+          "shell_skip_pct": [
+            0.0,
+            100.0,
+            100.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "straight_walk": {
+          "steps": 889,
+          "shell_skip_pct": [
+            98.4251968503937,
+            98.98762654668167,
+            98.98762654668167
+          ],
+          "transformer_skip_pct": 98.4251968503937
+        },
+        "active_turn": {
+          "steps": 626,
+          "shell_skip_pct": [
+            58.626198083067095,
+            98.24281150159744,
+            98.24281150159744
+          ],
+          "transformer_skip_pct": 58.626198083067095
+        }
+      }
+    },
+    {
+      "tau_gate": 0.2,
+      "sr_pct": 65.0,
+      "spl": 0.5210707294899587,
+      "mean_latent_cosine_vs_dense": 0.9244247368488477,
+      "mean_mflops_per_step": 44.86627751834556,
+      "mean_latency_ms": 23.00068492390507,
+      "shell_skip_pct": [
+        98.66577718478986,
+        98.66577718478986,
+        98.66577718478986
+      ],
+      "transformer_skip_pct": 98.66577718478986,
+      "by_regime": {
+        "idle": {
+          "steps": 0,
+          "shell_skip_pct": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "transformer_skip_pct": 0.0
+        },
+        "pitch_only": {
+          "steps": 1,
+          "shell_skip_pct": [
+            100.0,
+            100.0,
+            100.0
+          ],
+          "transformer_skip_pct": 100.0
+        },
+        "straight_walk": {
+          "steps": 878,
+          "shell_skip_pct": [
+            98.9749430523918,
+            98.9749430523918,
+            98.9749430523918
+          ],
+          "transformer_skip_pct": 98.9749430523918
+        },
+        "active_turn": {
+          "steps": 620,
+          "shell_skip_pct": [
+            98.22580645161291,
+            98.22580645161291,
+            98.22580645161291
+          ],
+          "transformer_skip_pct": 98.22580645161291
+        }
+      }
+    }
+  ]
+}

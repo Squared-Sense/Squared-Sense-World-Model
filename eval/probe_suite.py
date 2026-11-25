@@ -26,12 +26,20 @@ from train.gpu_env import setup_gpu_environment
 # Ensure non-greedy allocation and VRAM limits are set prior to XLA initialization
 setup_gpu_environment()
 
+# Prevent joblib/sklearn multiprocessing from calling os.fork() after JAX initialization
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.metrics import f1_score, r2_score, roc_auc_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from data.dataset import (
     compute_local_hazard_labels,
@@ -40,7 +48,7 @@ from data.dataset import (
     load_episode_splits,
 )
 from data.schema import normalize_shells
-from models.baselines import Generative3DMAE, SingleLODJEPA
+from models.baselines import Generative3DMAE, SingleLODJEPA, Uniform32JEPA
 from models.temporal_lstm import DualLSTMTemporalIntegrator
 from models.transformer import MultiLODBackbone, SpatialJEPA
 from train.checkpoint import load_checkpoint
@@ -72,22 +80,34 @@ def _rollout_temporal(
 
 
 @nnx.jit
+def _step_single(
+    temporal_model: DualLSTMTemporalIntegrator,
+    tok_t: jax.Array,
+    st_t: jax.Array,
+    act_t: jax.Array,
+    hidden: Any,
+) -> Tuple[jax.Array, Any]:
+    """Single JIT-compiled step on GPU (compiles in 0.1s without loop unrolling)."""
+    _, c_t, next_hidden = temporal_model.step(tok_t, st_t, act_t, hidden)
+    return jax.lax.stop_gradient(c_t), next_hidden
+
+
 def _step_context_states(
     temporal_model: DualLSTMTemporalIntegrator,
     tokens_seq: jax.Array,
     state_seq: jax.Array,
     action_seq: jax.Array,
 ) -> jax.Array:
-    """Extract fused context representations c_t across trajectory steps."""
+    """Extract fused context representations c_t across trajectory steps without loop unrolling."""
     b, T = tokens_seq.shape[:2]
     hidden = temporal_model.init_hidden(b)
     c_list = []
     for t in range(T):
-        _, c_t, hidden = temporal_model.step(
-            tokens_seq[:, t], state_seq[:, t], action_seq[:, t], hidden
+        c_t, hidden = _step_single(
+            temporal_model, tokens_seq[:, t], state_seq[:, t], action_seq[:, t], hidden
         )
         c_list.append(c_t)
-    return jax.lax.stop_gradient(jnp.stack(c_list, axis=1))
+    return jnp.stack(c_list, axis=1)
 
 
 def extract_features(
@@ -98,6 +118,7 @@ def extract_features(
     action: Optional[np.ndarray | jax.Array] = None,
     temporal_model: Optional[DualLSTMTemporalIntegrator] = None,
     batch_size: int = 32,
+    episode_lengths: Optional[List[int]] = None,
 ) -> np.ndarray:
     """Extract frozen inference embeddings for a given model architecture.
 
@@ -122,7 +143,7 @@ def extract_features(
           - (N, 256) for static models (m2_static, b1_lod0, b2_lod2, b3_mae)
           - (N, 448) for m1_full concatenating z_t and c_t
     """
-    valid_types = {"m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae"}
+    valid_types = {"m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae", "b4_uniform32"}
     if model_type not in valid_types:
         raise ValueError(f"Unknown model_type '{model_type}'. Expected one of {valid_types}")
 
@@ -136,7 +157,7 @@ def extract_features(
     # Resolve encoder
     if model_type in ("m2_static", "m1_full"):
         encoder = model.context_encoder if hasattr(model, "context_encoder") else model
-    elif model_type in ("b1_lod0", "b2_lod2"):
+    elif model_type in ("b1_lod0", "b2_lod2", "b4_uniform32"):
         if hasattr(model, "context_encoder"):
             encoder = model.context_encoder
         elif hasattr(model, "jepa") and hasattr(model.jepa, "context_encoder"):
@@ -157,6 +178,8 @@ def extract_features(
             bx = bx[:, 0:1]
         elif model_type == "b2_lod2":
             bx = bx[:, 2:3]
+        elif model_type == "b4_uniform32" and bx.ndim == 5:
+            bx = jnp.expand_dims(bx, axis=1)
 
         tokens = _forward_tokens(encoder, bx)
         z_batch = jnp.mean(tokens, axis=1)  # (B, 256)
@@ -177,13 +200,25 @@ def extract_features(
     st = jnp.zeros((n_samples, 12), dtype=jnp.float32) if state is None else jnp.asarray(state, dtype=jnp.float32)
     act = jnp.zeros((n_samples,), dtype=jnp.int32) if action is None else jnp.asarray(action, dtype=jnp.int32)
 
-    # Treat as sequence: (1, N, ...)
-    tok_seq = all_tokens[None, ...]
-    st_seq = st[None, ...]
-    act_seq = act[None, ...]
+    if episode_lengths is not None and sum(episode_lengths) == n_samples:
+        c_chunks = []
+        offset = 0
+        for ep_len in episode_lengths:
+            tok_ep = all_tokens[offset : offset + ep_len][None, ...]
+            st_ep = st[offset : offset + ep_len][None, ...]
+            act_ep = act[offset : offset + ep_len][None, ...]
+            c_ep = _step_context_states(temporal_model, tok_ep, st_ep, act_ep)
+            c_chunks.append(np.asarray(c_ep[0], dtype=np.float32))
+            offset += ep_len
+        c_all = np.concatenate(c_chunks, axis=0)
+    else:
+        # Treat as sequence: (1, N, ...)
+        tok_seq = all_tokens[None, ...]
+        st_seq = st[None, ...]
+        act_seq = act[None, ...]
 
-    c_seq = _step_context_states(temporal_model, tok_seq, st_seq, act_seq)  # (1, N, 192)
-    c_all = np.asarray(c_seq[0], dtype=np.float32)  # (N, 192)
+        c_seq = _step_context_states(temporal_model, tok_seq, st_seq, act_seq)  # (1, N, 192)
+        c_all = np.asarray(c_seq[0], dtype=np.float32)  # (N, 192)
 
     feat = np.concatenate([z_all, c_all], axis=-1)  # (N, 448)
     return feat.astype(np.float32)
@@ -219,7 +254,7 @@ def probe_distant_goal(
     cos_list = []
 
     for seed in seeds:
-        reg = Ridge(alpha=1.0, random_state=seed)
+        reg = make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-3, 3, 7)))
         reg.fit(X_train, y_train)
         y_pred = reg.predict(X_test)
 
@@ -286,8 +321,11 @@ def probe_local_hazard(
         }
 
     for seed in seeds:
-        clf = LogisticRegression(
-            max_iter=500, class_weight="balanced", random_state=seed
+        clf = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                max_iter=1000, class_weight="balanced", random_state=seed
+            ),
         )
         clf.fit(X_train, y_train)
         pred = clf.predict(X_test)
@@ -341,7 +379,7 @@ def probe_kinematic_and_occlusion(
 
     for seed in seeds:
         # 1. Velocity regression
-        reg = Ridge(alpha=1.0, random_state=seed)
+        reg = make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-3, 3, 7)))
         reg.fit(X_train, v_train)
         v_pred = reg.predict(X_test)
         v_r2 = float(r2_score(v_test, v_pred))
@@ -352,8 +390,11 @@ def probe_kinematic_and_occlusion(
             pred_occ = np.full_like(occ_test, occ_train_classes[0])
             occ_f1 = float(f1_score(occ_test, pred_occ, zero_division=0.0))
         else:
-            clf = LogisticRegression(
-                max_iter=500, class_weight="balanced", random_state=seed
+            clf = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(
+                    max_iter=1000, class_weight="balanced", random_state=seed
+                ),
             )
             clf.fit(X_train, occ_train)
             pred_occ = clf.predict(X_test)
@@ -499,8 +540,20 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--model_type",
         type=str,
         default="m2_static",
-        choices=["m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae"],
+        choices=["m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae", "b4_uniform32"],
         help="Model architecture variant to probe.",
+    )
+    parser.add_argument(
+        "--train_fractions",
+        type=float,
+        nargs="+",
+        default=[1.0],
+        help="Episode-level training fractions for few-shot probing (e.g., 0.1 0.25 1.0).",
+    )
+    parser.add_argument(
+        "--allow_upsample_fallback",
+        action="store_true",
+        help="Allow 2x upsampling from LOD-1 for b4_uniform32 when --region_dir is omitted (unit tests only).",
     )
     parser.add_argument(
         "--ckpt",
@@ -548,15 +601,18 @@ def run_probe_suite(
     region_dir: Optional[str] = None,
     out_json: Optional[str] = None,
     smoke_test: bool = True,
+    train_fractions: Optional[List[float]] = None,
+    allow_upsample_fallback: bool = False,
 ) -> Dict[str, Any]:
     """Execute the full frozen representation and dynamics probe suite."""
     rng = nnx.Rngs(42)
-    data_dir = data_dir or region_dir
+    effective_data_dir = data_dir or region_dir
+    fractions = train_fractions if train_fractions else [1.0]
 
     # 1. Instantiate model
     temporal_model: Optional[DualLSTMTemporalIntegrator] = None
     if model_type == "m2_static":
-        model = SpatialJEPA(num_shells=3, rngs=rng)
+        model: Any = SpatialJEPA(num_shells=3, rngs=rng)
     elif model_type == "m1_full":
         model = SpatialJEPA(num_shells=3, rngs=rng)
         temporal_model = DualLSTMTemporalIntegrator(rngs=rng)
@@ -566,6 +622,8 @@ def run_probe_suite(
         model = SingleLODJEPA(lod_index=2, rngs=rng)
     elif model_type == "b3_mae":
         model = Generative3DMAE(rngs=rng)
+    elif model_type == "b4_uniform32":
+        model = Uniform32JEPA(rngs=rng)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -576,12 +634,19 @@ def run_probe_suite(
         load_checkpoint(temporal_ckpt, temporal_model)
 
     # 2. Prepare evaluation data
-    if smoke_test or data_dir is None:
+    train_ep_lens: Optional[List[int]] = None
+    if smoke_test or effective_data_dir is None:
         num_episodes = 4
         clip_len = 24
         data = generate_synthetic_probe_data(num_episodes=num_episodes, clip_len=clip_len)
 
         shells = data["shells"]
+        if model_type == "b4_uniform32":
+            shells_in = np.random.default_rng(42).uniform(
+                0.0, 1.0, size=(len(shells), 32, 32, 32, 16)
+            ).astype(np.float32)
+        else:
+            shells_in = shells
         state = data["state"]
         action = data["action"]
         meta = data["meta"]
@@ -593,16 +658,18 @@ def run_probe_suite(
         features = extract_features(
             model=model,
             model_type=model_type,
-            shells=shells,
+            shells=shells_in,
             state=state,
             action=action,
             temporal_model=temporal_model,
             batch_size=32,
+            episode_lengths=[clip_len] * num_episodes,
         )
 
         # Train/test split by episode ID (NEVER frame shuffle)
         # Episode 0..2 (72 frames) train, Episode 3 (24 frames) test
         train_n = 3 * clip_len
+        train_ep_lens = [clip_len, clip_len, clip_len]
         X_train, X_test = features[:train_n], features[train_n:]
         y_train_goal, y_test_goal = meta[:train_n, 3:6], meta[train_n:, 3:6]
         y_train_haz, y_test_haz = hazard[:train_n], hazard[train_n:]
@@ -610,15 +677,17 @@ def run_probe_suite(
         occ_train, occ_test = occlusion[:train_n], occlusion[train_n:]
 
         # Multi-step rollout
-        # Shape tokens_seq: (num_episodes, clip_len, 192, 256) or pooled (num_episodes, clip_len, 256)
-        tok_seq = shells.reshape((num_episodes, clip_len, 3, 16, 16, 16, 16))
+        if model_type == "b4_uniform32":
+            tok_seq = shells_in.reshape((num_episodes, clip_len, 1, 32, 32, 32, 16))
+        else:
+            tok_seq = shells.reshape((num_episodes, clip_len, 3, 16, 16, 16, 16))
+            if model_type in ("b1_lod0",):
+                tok_seq = tok_seq[:, :, 0:1]
+            elif model_type in ("b2_lod2",):
+                tok_seq = tok_seq[:, :, 2:3]
         encoder = model.context_encoder if hasattr(model, "context_encoder") else (
             model.encoder if hasattr(model, "encoder") else model
         )
-        if model_type in ("b1_lod0",):
-            tok_seq = tok_seq[:, :, 0:1]
-        elif model_type in ("b2_lod2",):
-            tok_seq = tok_seq[:, :, 2:3]
 
         flat_tok = _forward_tokens(encoder, tok_seq.reshape(-1, *tok_seq.shape[2:]))
         tokens_seq_4d = flat_tok.reshape((num_episodes, clip_len, flat_tok.shape[1], 256))
@@ -634,9 +703,10 @@ def run_probe_suite(
             horizons=(1, 2, 4, 8),
         )
     else:
-        splits = load_episode_splits(data_dir, seed=42)
+        splits = load_episode_splits(effective_data_dir, seed=42)
         train_eps = splits["train"]
         test_eps = splits["test"] if len(splits["test"]) > 0 else splits["val"]
+        train_ep_lens = [len(ep["shells"]) for ep in train_eps]
 
         def _process_episodes(ep_list: List[Dict[str, np.ndarray]]):
             sh_list, st_list, ac_list, me_list, hz_list, oc_list = [], [], [], [], [], []
@@ -666,23 +736,69 @@ def run_probe_suite(
         train_sh, train_st, train_ac, train_me, train_hz, train_oc = _process_episodes(train_eps)
         test_sh, test_st, test_ac, test_me, test_hz, test_oc = _process_episodes(test_eps)
 
+        if model_type == "b4_uniform32":
+            if region_dir and os.path.isdir(region_dir):
+                import math as _math
+                from env.lod_extractor import WorldVolume, extract_uniform32_16ch
+                from env.palette import get_palette
+                palette = get_palette()
+                world = WorldVolume(region_dir, palette_obj=palette)
+
+                def _yaw_to_cardinal(sin_y: float, cos_y: float) -> str:
+                    yaw = (_math.degrees(_math.atan2(-sin_y, cos_y)) % 360.0 + 360.0) % 360.0
+                    if 45.0 <= yaw < 135.0:
+                        return "WEST"
+                    if 135.0 <= yaw < 225.0:
+                        return "NORTH"
+                    if 225.0 <= yaw < 315.0:
+                        return "EAST"
+                    return "SOUTH"
+
+                def _extract_32_batch(me_arr, st_arr):
+                    return np.stack([
+                        extract_uniform32_16ch(
+                            world, palette,
+                            (int(round(me_arr[i, 0])), int(round(me_arr[i, 1])), int(round(me_arr[i, 2]))),
+                            _yaw_to_cardinal(float(st_arr[i, 6]), float(st_arr[i, 7])),
+                            float(st_arr[i, 8]),
+                            as_uint8=False,
+                        )
+                        for i in range(len(me_arr))
+                    ], axis=0)
+
+                train_sh_in = _extract_32_batch(train_me, train_st)
+                test_sh_in = _extract_32_batch(test_me, test_st)
+            elif allow_upsample_fallback:
+                train_sh_in = np.repeat(np.repeat(np.repeat(train_sh[:, 1], 2, axis=1), 2, axis=2), 2, axis=3)
+                test_sh_in = np.repeat(np.repeat(np.repeat(test_sh[:, 1], 2, axis=1), 2, axis=2), 2, axis=3)
+            else:
+                raise ValueError(
+                    "b4_uniform32 in probe_suite requires --region_dir pointing to baked Minecraft regions (.mmap) "
+                    "for true 1x 32x32x32x16 extraction. Pass --allow_upsample_fallback only for unit tests."
+                )
+        else:
+            train_sh_in = train_sh
+            test_sh_in = test_sh
+
         X_train = extract_features(
             model=model,
             model_type=model_type,
-            shells=train_sh,
+            shells=train_sh_in,
             state=train_st,
             action=train_ac,
             temporal_model=temporal_model,
             batch_size=32,
+            episode_lengths=train_ep_lens,
         )
         X_test = extract_features(
             model=model,
             model_type=model_type,
-            shells=test_sh,
+            shells=test_sh_in,
             state=test_st,
             action=test_ac,
             temporal_model=temporal_model,
             batch_size=32,
+            episode_lengths=[len(ep["shells"]) for ep in test_eps],
         )
 
         y_train_goal, y_test_goal = train_me[:, 3:6], test_me[:, 3:6]
@@ -704,11 +820,14 @@ def run_probe_suite(
         )
         target_encoder = model.target_encoder if hasattr(model, "target_encoder") else encoder
 
-        eval_flat_shells = flat_shells
-        if model_type in ("b1_lod0",):
+        if model_type == "b4_uniform32":
+            eval_flat_shells = np.repeat(np.repeat(np.repeat(flat_shells[:, 1:2], 2, axis=2), 2, axis=3), 2, axis=4)
+        elif model_type in ("b1_lod0",):
             eval_flat_shells = flat_shells[:, 0:1]
         elif model_type in ("b2_lod2",):
             eval_flat_shells = flat_shells[:, 2:3]
+        else:
+            eval_flat_shells = flat_shells
 
         flat_tok = _forward_tokens(encoder, eval_flat_shells)
         tokens_seq_4d = flat_tok.reshape((b, T, flat_tok.shape[1], 256))
@@ -731,10 +850,53 @@ def run_probe_suite(
         )
         features = X_test
 
-    # 4. Run frozen probes
+    # 4. Run frozen probes (and optional episode-level few-shot sweep)
     goal_res = probe_distant_goal(X_train, y_train_goal, X_test, y_test_goal)
     hazard_res = probe_local_hazard(X_train, y_train_haz, X_test, y_test_haz)
     kin_occ_res = probe_kinematic_and_occlusion(X_train, v_train, occ_train, X_test, v_test, occ_test)
+
+    few_shot: Dict[str, Any] = {}
+    if train_ep_lens is not None and any(f < 1.0 for f in fractions):
+        ep_slices: List[Tuple[int, int]] = []
+        off = 0
+        for el in train_ep_lens:
+            ep_slices.append((off, off + el))
+            off += el
+        n_eps = len(ep_slices)
+        for frac in fractions:
+            if frac >= 1.0:
+                few_shot["1.0"] = {
+                    "distant_goal": goal_res,
+                    "local_hazard": hazard_res,
+                    "kinematic_and_occlusion": kin_occ_res,
+                }
+                continue
+            k_eps = max(1, int(round(frac * n_eps)))
+            seed_goals, seed_hazs, seed_kins = [], [], []
+            for s in (0, 1, 2):
+                s_rng = np.random.default_rng(s)
+                chosen = s_rng.choice(n_eps, size=k_eps, replace=False)
+                idx_list = np.concatenate([np.arange(ep_slices[c][0], ep_slices[c][1]) for c in chosen])
+                seed_goals.append(probe_distant_goal(X_train[idx_list], y_train_goal[idx_list], X_test, y_test_goal, seeds=(s,)))
+                seed_hazs.append(probe_local_hazard(X_train[idx_list], y_train_haz[idx_list], X_test, y_test_haz, seeds=(s,)))
+                seed_kins.append(probe_kinematic_and_occlusion(X_train[idx_list], v_train[idx_list], occ_train[idx_list], X_test, v_test, occ_test, seeds=(s,)))
+            few_shot[str(frac)] = {
+                "num_train_episodes": k_eps,
+                "distant_goal": {
+                    "r2": float(np.mean([g["r2"] for g in seed_goals])),
+                    "r2_std": float(np.std([g["r2"] for g in seed_goals])),
+                    "mean_cosine_sim": float(np.mean([g["mean_cosine_sim"] for g in seed_goals])),
+                },
+                "local_hazard": {
+                    "f1": float(np.mean([h["f1"] for h in seed_hazs])),
+                    "f1_std": float(np.std([h["f1"] for h in seed_hazs])),
+                    "auroc": float(np.mean([h["auroc"] for h in seed_hazs])),
+                },
+                "kinematic_and_occlusion": {
+                    "velocity_r2": float(np.mean([k["velocity_r2"] for k in seed_kins])),
+                    "occlusion_f1": float(np.mean([k["occlusion_f1"] for k in seed_kins])),
+                },
+            }
 
     # 5. Compile summary table
     summary: Dict[str, Any] = {
@@ -753,6 +915,8 @@ def run_probe_suite(
         "occlusion_f1": kin_occ_res["occlusion_f1"],
         "rankme": rollout_res["rankme"],
     }
+    if few_shot:
+        summary["few_shot"] = few_shot
     for h in (1, 2, 4, 8):
         summary[f"cosine_sim_h{h}"] = rollout_res[f"cosine_sim_h{h}"]
         summary[f"l1_error_h{h}"] = rollout_res[f"l1_error_h{h}"]
@@ -776,6 +940,8 @@ def main() -> None:
         region_dir=args.region_dir,
         out_json=args.out_json,
         smoke_test=args.smoke_test,
+        train_fractions=args.train_fractions,
+        allow_upsample_fallback=args.allow_upsample_fallback,
     )
     print(f"\n=== Evaluation Probe Summary ({summary['model_type']}) ===")
     print(f"Feature Dimension       : {summary['feature_dim']}")

@@ -69,16 +69,19 @@ class MultiLODBackbone(nnx.Module):
         depth: int = 4,
         num_heads: int = 8,
         num_shells: int = 3,
+        spatial_size: int = 16,
         *,
         rngs: nnx.Rngs,
     ) -> None:
         self.dim = dim
         self.num_shells = num_shells
-        self.cnn = SiameseVoxelCNN(embed_dim=dim, rngs=rngs)
+        self.spatial_size = spatial_size
+        self.grid_tokens = (spatial_size // 4) ** 3
+        self.cnn = SiameseVoxelCNN(embed_dim=dim, spatial_size=spatial_size, rngs=rngs)
 
         # Positional and scale embeddings
         self.spatial_pos_embed = nnx.Param(
-            jax.random.normal(rngs.params(), (1, 64, dim)) * 0.02
+            jax.random.normal(rngs.params(), (1, self.grid_tokens, dim)) * 0.02
         )
         self.scale_embed = nnx.Param(
             jax.random.normal(rngs.params(), (1, num_shells, 1, dim)) * 0.02
@@ -112,10 +115,10 @@ class MultiLODBackbone(nnx.Module):
         Returns:
             Encoded tokens (B, N_vis, dim) or (B, num_shells * 64, dim).
         """
-        # Combine spatial (1, 64, dim) and scale (1, num_shells, 1, dim) embeddings
-        spatial = self.spatial_pos_embed[...].reshape((1, 1, 64, self.dim))
+        # Combine spatial (1, grid_tokens, dim) and scale (1, num_shells, 1, dim) embeddings
+        spatial = self.spatial_pos_embed[...].reshape((1, 1, self.grid_tokens, self.dim))
         scale = self.scale_embed[...]
-        full_pos = (spatial + scale).reshape((1, self.num_shells * 64, self.dim))
+        full_pos = (spatial + scale).reshape((1, self.num_shells * self.grid_tokens, self.dim))
         tokens = tokens + full_pos
 
         if visible_idx is not None:
@@ -166,19 +169,21 @@ class JEPAPredictor(nnx.Module):
         depth: int = 2,
         num_heads: int = 6,
         num_shells: int = 3,
+        grid_tokens: int = 64,
         *,
         rngs: nnx.Rngs,
     ) -> None:
         self.enc_dim = enc_dim
         self.pred_dim = pred_dim
         self.num_shells = num_shells
+        self.grid_tokens = grid_tokens
 
         self.input_proj = nnx.Linear(enc_dim, pred_dim, rngs=rngs)
         self.mask_token = nnx.Param(
             jax.random.normal(rngs.params(), (1, 1, pred_dim)) * 0.02
         )
         self.spatial_pos_embed = nnx.Param(
-            jax.random.normal(rngs.params(), (1, 64, pred_dim)) * 0.02
+            jax.random.normal(rngs.params(), (1, grid_tokens, pred_dim)) * 0.02
         )
         self.scale_embed = nnx.Param(
             jax.random.normal(rngs.params(), (1, num_shells, 1, pred_dim)) * 0.02
@@ -218,9 +223,9 @@ class JEPAPredictor(nnx.Module):
         ctx = self.input_proj(context_tokens)
 
         # Full positional embeddings for predictor
-        spatial = self.spatial_pos_embed[...].reshape((1, 1, 64, self.pred_dim))
+        spatial = self.spatial_pos_embed[...].reshape((1, 1, self.grid_tokens, self.pred_dim))
         scale = self.scale_embed[...]
-        pred_pos = (spatial + scale).reshape((1, self.num_shells * 64, self.pred_dim))
+        pred_pos = (spatial + scale).reshape((1, self.num_shells * self.grid_tokens, self.pred_dim))
 
         # Add predictor pos embeddings to context tokens
         ctx_pos = jnp.take_along_axis(
@@ -338,11 +343,16 @@ class SpatialJEPA(nnx.Module):
       - predictor: JEPAPredictor trained to predict target latents from context
     """
 
-    def __init__(self, num_shells: int = 3, *, rngs: nnx.Rngs) -> None:
+    def __init__(self, num_shells: int = 3, spatial_size: int = 16, *, rngs: nnx.Rngs) -> None:
         self.num_shells = num_shells
-        self.context_encoder = MultiLODBackbone(num_shells=num_shells, rngs=rngs)
+        self.spatial_size = spatial_size
+        self.context_encoder = MultiLODBackbone(
+            num_shells=num_shells, spatial_size=spatial_size, rngs=rngs
+        )
         self.target_encoder = nnx.clone(self.context_encoder)
-        self.predictor = JEPAPredictor(num_shells=num_shells, rngs=rngs)
+        self.predictor = JEPAPredictor(
+            num_shells=num_shells, grid_tokens=(spatial_size // 4) ** 3, rngs=rngs
+        )
 
     def update_ema(self, momentum: float) -> None:
         """Update target encoder parameters in-place via EMA: target = m * target + (1-m) * context."""

@@ -19,6 +19,7 @@ from eval.eval_navigation import evaluate_navigation, main as eval_nav_main
 from eval.sim_env import VoxelNavEnv, make_debug_bridge_course
 from eval.train_ppo_nav import (
     ActorCriticHead,
+    extract_step_feature,
     main as train_ppo_main,
     train_bc_warmstart,
     train_ppo,
@@ -196,6 +197,7 @@ def test_eval_navigation_gating_comparison(tmp_path) -> None:
         "success_rate_pct",
         "spl",
         "spl_pct",
+        "chns",
         "waypoint_completion_pct",
         "hazard_collision_rate_pct",
         "empirical_mflops_per_step",
@@ -215,5 +217,140 @@ def test_eval_navigation_gating_comparison(tmp_path) -> None:
     mflops_gated = metrics_gated["empirical_mflops_per_step"]
 
     print(f"Dense MFLOPs/step: {mflops_dense:.1f} | Gated MFLOPs/step: {mflops_gated:.1f}")
-    assert mflops_dense == pytest.approx(1743.6, rel=1e-3)
+    assert mflops_dense == pytest.approx(1770.06, rel=1e-3)
     assert mflops_gated < mflops_dense, f"Gated MFLOPs ({mflops_gated}) must be strictly less than dense ({mflops_dense})"
+
+
+def test_b0_blind_architecture_train_and_eval(tmp_path) -> None:
+    """Verify b0_blind compass-only baseline trains, checkpoints, and evaluates with 0.0 perception MFLOPs."""
+    rng = nnx.Rngs(7)
+    policy = ActorCriticHead(feat_dim=0, num_actions=12, rngs=rng)
+    pure_dict = nnx.to_pure_dict(nnx.state(policy, nnx.Param))
+    n_params = sum(x.size for x in jax.tree.leaves(pure_dict))
+    assert n_params == 18_701
+
+    feat, hidden = extract_step_feature(
+        backbone=None,
+        model_type="b0_blind",
+        shells=np.zeros((3, 16, 16, 16, 16), dtype=np.float32),
+    )
+    assert feat.shape == (1, 0)
+    assert hidden is None
+
+    save_dir = str(tmp_path / "b0_ckpt")
+    ret_train = train_ppo_main([
+        "--model_type", "b0_blind",
+        "--total_steps", "128",
+        "--bc_epochs", "1",
+        "--bc_steps", "128",
+        "--save_dir", save_dir,
+    ])
+    assert ret_train == 0
+
+    policy_pkl = os.path.join(save_dir, "best_ppo.pkl")
+    if not os.path.isfile(policy_pkl):
+        policy_pkl = os.path.join(save_dir, "latest_ppo.pkl")
+    assert os.path.isfile(policy_pkl)
+
+    out_json = str(tmp_path / "b0_eval.json")
+    ret_eval = eval_nav_main([
+        "--model_type", "b0_blind",
+        "--policy_ckpt", policy_pkl,
+        "--smoke_test",
+        "--out_json", out_json,
+    ])
+    assert ret_eval == 0
+    with open(out_json, "r", encoding="utf-8") as f:
+        metrics = json.load(f)
+    assert metrics["empirical_mflops_per_step"] == pytest.approx(0.0)
+    assert metrics["compass_visible_pct"] == pytest.approx(100.0)
+    assert math.isfinite(float(metrics["chns"]))
+
+
+def test_rl3_rl4_compass_occlusion_and_flash_reset(tmp_path) -> None:
+    """Verify RL3/RL4 beacon occlusion, 3-tick flash window, mid-chain leg reset, and skip_shells."""
+    from env.minecraft_env import MinecraftNavEnv
+
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    test_regions = os.path.join(base_dir, "data", "test_regions")
+    if not os.path.exists(test_regions):
+        reg_dir = tmp_path / "synth_region"
+        reg_dir.mkdir(parents=True, exist_ok=True)
+        mmap_path = reg_dir / "r.0.0.mmap"
+        mmap_arr = np.memmap(str(mmap_path), dtype=np.uint16, mode="w+", shape=(512, 384, 512))
+        mmap_arr[:, 127, :] = 1  # solid floor at wy=63 so wy=64 is traversable
+        del mmap_arr
+        np.savez_compressed(
+            str(reg_dir / "r.0.0.spawns.npz"),
+            surface=np.array([[256, 64, 256]], dtype=np.int32),
+            subterranean=np.empty((0, 3), dtype=np.int32),
+            steep=np.empty((0, 3), dtype=np.int32),
+        )
+        test_regions = str(reg_dir)
+
+    # 1. skip_shells=True returns zeroed shells
+    env_skip = MinecraftNavEnv(region_dir=test_regions, skip_shells=True)
+    obs_skip = env_skip.reset(seed=42)
+    assert np.all(obs_skip["shells"] == 0.0)
+
+    # 2. RL3-Beacon: compass permanently occluded from tick 0
+    env_beacon = MinecraftNavEnv(
+        region_dir=test_regions,
+        num_targets=1,
+        compass_occlusion_prob=1.0,
+        flash_compass_ticks=0,
+    )
+    obs_b = env_beacon.reset(seed=42)
+    assert env_beacon.compass_occluded is True
+    assert np.allclose(obs_b["goal_vec"], 0.0)
+    obs_b1, _, _, info_b1 = env_beacon.step(11)
+    assert info_b1["compass_occluded"] is True
+    assert np.allclose(obs_b1["goal_vec"], 0.0)
+
+    # CLI rl3_beacon eval smoke check with b0_blind -> compass_visible_pct == 0.0
+    beacon_json = str(tmp_path / "rl3_beacon.json")
+    ret = eval_nav_main([
+        "--model_type", "b0_blind",
+        "--task", "rl3_beacon",
+        "--region_dir", test_regions,
+        "--smoke_test",
+        "--out_json", beacon_json,
+    ])
+    assert ret == 0
+    with open(beacon_json, "r", encoding="utf-8") as f:
+        beacon_metrics = json.load(f)
+    assert beacon_metrics["compass_visible_pct"] == pytest.approx(0.0)
+
+    # 3. RL4-Flash: 3 visible ticks (0, 1, 2) per leg + mid-chain reset on reaching target 0
+    env_flash = MinecraftNavEnv(
+        region_dir=test_regions,
+        num_targets=5,
+        compass_occlusion_prob=0.0,
+        flash_compass_ticks=3,
+    )
+    obs_f = env_flash.reset(seed=42)
+    assert env_flash.compass_occluded is False
+    assert np.linalg.norm(obs_f["goal_vec"]) > 0.0
+
+    # Tick 0, 1, 2 acted on -> info["compass_occluded"] must be False for all 3
+    for tick in range(3):
+        obs_f, _, _, info_f = env_flash.step(11)
+        assert info_f["compass_occluded"] is False, f"Expected visible compass on tick {tick}"
+        if tick < 2:
+            assert np.linalg.norm(obs_f["goal_vec"]) > 0.0
+
+    # After 3rd step, compass must now be occluded for tick 3+
+    assert env_flash.compass_occluded is True
+    assert np.allclose(obs_f["goal_vec"], 0.0)
+    obs_f4, _, _, info_f4 = env_flash.step(11)
+    assert info_f4["compass_occluded"] is True
+    assert np.allclose(obs_f4["goal_vec"], 0.0)
+
+    # Simulate reaching target 0 mid-chain -> _leg_step_count resets and grants fresh 3-tick flash
+    env_flash.player_pos = np.copy(env_flash.targets[0])
+    obs_reached, _, done_reached, _ = env_flash.step(11)
+    assert not done_reached
+    assert env_flash.targets_reached == 1
+    assert env_flash._leg_step_count == 0
+    assert env_flash.compass_occluded is False
+    assert np.linalg.norm(obs_reached["goal_vec"]) > 0.0

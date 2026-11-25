@@ -13,6 +13,7 @@ Strictly follows docs/TRAIN_CONTRACT.md and docs/MODEL_CONTRACT.md.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import math
 import os
 import sys
@@ -28,6 +29,10 @@ from train.gpu_env import auto_configure_batching, setup_gpu_environment
 # Ensure non-greedy allocation and VRAM limits are set prior to XLA initialization
 setup_gpu_environment()
 
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -38,7 +43,7 @@ from data.dataset import extract_temporal_clips, load_episode_splits
 from models.temporal_lstm import DualLSTMTemporalIntegrator
 from models.transformer import SpatialJEPA, sample_3d_jepa_masks
 from train.checkpoint import load_checkpoint, save_checkpoint
-from train.diagnostics import append_metrics_jsonl, compute_rankme
+from train.diagnostics import ProgressBar, append_metrics_jsonl, compute_rankme
 from train.losses import spatial_jepa_loss, temporal_jepa_loss
 
 
@@ -138,6 +143,36 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Random seed for PRNG initialization (default: 42).",
     )
     parser.add_argument(
+        "--as_uint8",
+        action="store_true",
+        default=True,
+        help="Store voxel shells in RAM as uint8 and normalize per batch inside train_step (default: True).",
+    )
+    parser.add_argument(
+        "--no_as_uint8",
+        action="store_false",
+        dest="as_uint8",
+        help="Disable uint8 storage and eagerly normalize to float32 in RAM.",
+    )
+    parser.add_argument(
+        "--drop_last",
+        action="store_true",
+        default=True,
+        help="Enforce static batch sizes during training to prevent recompilation (default: True).",
+    )
+    parser.add_argument(
+        "--no_drop_last",
+        action="store_false",
+        dest="drop_last",
+        help="Allow variable-sized last batch (may cause JIT recompilation).",
+    )
+    parser.add_argument(
+        "--log_every",
+        type=int,
+        default=25,
+        help="Step interval for mini-logs and progress bar updates (default: 25).",
+    )
+    parser.add_argument(
         "--smoke_test",
         action="store_true",
         help="Run fast smoke test (1 epoch Phase 1 + 1 epoch Phase 2 on synthetic clips, batch_size=2).",
@@ -149,6 +184,8 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         parsed.phase2_epochs = 1
         parsed.batch_size = 2
         parsed.clip_len = 16
+        if parsed.log_every == 5:
+            parsed.log_every = 2
 
     return parsed
 
@@ -183,6 +220,8 @@ def train_step_phase1(
     Returns:
         (loss, metrics_dict) tuple.
     """
+    if shells.dtype == jnp.uint8:
+        shells = shells.astype(jnp.float32) / 255.0
     b, T = shells.shape[0], shells.shape[1]
 
     # Extract spatial tokens with stop_gradient
@@ -256,6 +295,8 @@ def train_step_phase2(
     Returns:
         (total_loss, metrics_dict) tuple.
     """
+    if shells.dtype == jnp.uint8:
+        shells = shells.astype(jnp.float32) / 255.0
     b, T = shells.shape[0], shells.shape[1]
     k_frame, k_mask = jax.random.split(rng_key)
     frame_idx = jax.random.randint(k_frame, (), 0, T)
@@ -376,6 +417,8 @@ def val_step(
     Returns:
         (val_loss, metrics_dict, c_seq) tuple.
     """
+    if shells.dtype == jnp.uint8:
+        shells = shells.astype(jnp.float32) / 255.0
     b, T = shells.shape[0], shells.shape[1]
     flat_shells = shells.reshape((b * T, 3, 16, 16, 16, 16))
     tokens = spatial_model.context_encoder(flat_shells, visible_idx=None)
@@ -412,6 +455,7 @@ def load_temporal_dataset(
     smoke_test: bool,
     seed: int,
     clip_len: int = 16,
+    as_uint8: bool = True,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     """Load or synthetically generate trajectory clips.
 
@@ -422,19 +466,25 @@ def load_temporal_dataset(
         rng = np.random.default_rng(seed)
         n_train = 4
         n_val = 2
+        if as_uint8:
+            train_shells = rng.integers(0, 256, size=(n_train, clip_len, 3, 16, 16, 16, 16), dtype=np.uint8)
+            val_shells = rng.integers(0, 256, size=(n_val, clip_len, 3, 16, 16, 16, 16), dtype=np.uint8)
+        else:
+            train_shells = rng.uniform(0.0, 1.0, size=(n_train, clip_len, 3, 16, 16, 16, 16)).astype(np.float32)
+            val_shells = rng.uniform(0.0, 1.0, size=(n_val, clip_len, 3, 16, 16, 16, 16)).astype(np.float32)
         train_data = {
-            "shells": rng.uniform(0.0, 1.0, size=(n_train, clip_len, 3, 16, 16, 16, 16)).astype(np.float32),
+            "shells": train_shells,
             "states": rng.normal(0.0, 1.0, size=(n_train, clip_len, 12)).astype(np.float32),
             "actions": rng.integers(0, 12, size=(n_train, clip_len), dtype=np.int32),
         }
         val_data = {
-            "shells": rng.uniform(0.0, 1.0, size=(n_val, clip_len, 3, 16, 16, 16, 16)).astype(np.float32),
+            "shells": val_shells,
             "states": rng.normal(0.0, 1.0, size=(n_val, clip_len, 12)).astype(np.float32),
             "actions": rng.integers(0, 12, size=(n_val, clip_len), dtype=np.int32),
         }
         return train_data, val_data
 
-    splits = load_episode_splits(data_dir, seed=seed)
+    splits = load_episode_splits(data_dir, seed=seed, as_uint8=as_uint8)
     train_data = extract_temporal_clips(splits["train"], clip_len=clip_len, stride=4)
     val_data = extract_temporal_clips(splits["val"], clip_len=clip_len, stride=4)
     return train_data, val_data
@@ -443,6 +493,7 @@ def load_temporal_dataset(
 def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalIntegrator, SpatialJEPA]:
     """Run full two-phase Stage 1B Temporal JEPA training pipeline."""
     os.makedirs(args.save_dir, exist_ok=True)
+    log_path = os.path.join(args.save_dir, "train.log")
     metrics_path = os.path.join(args.save_dir, "metrics.jsonl")
     temp_best_ckpt = os.path.join(args.save_dir, "temporal_best.pkl")
     spat_best_ckpt = os.path.join(args.save_dir, "spatial_finetuned_best.pkl")
@@ -480,11 +531,21 @@ def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalInteg
 
     # 2. Load dataset
     effective_data_dir = args.data_dir or args.region_dir
-    train_dict, val_dict = load_temporal_dataset(effective_data_dir, args.smoke_test, args.seed, args.clip_len)
+    as_uint8 = getattr(args, "as_uint8", True)
+    train_dict, val_dict = load_temporal_dataset(
+        effective_data_dir, args.smoke_test, args.seed, args.clip_len, as_uint8=as_uint8
+    )
     num_train = len(train_dict["shells"])
     num_val = len(val_dict["shells"])
-    steps_per_epoch = max(1, math.ceil(num_train / args.batch_size))
-    val_steps = max(1, math.ceil(num_val / args.batch_size))
+    drop_last = getattr(args, "drop_last", True)
+    if drop_last and num_train >= args.batch_size:
+        steps_per_epoch = max(1, num_train // args.batch_size)
+    else:
+        steps_per_epoch = max(1, math.ceil(num_train / args.batch_size))
+    if drop_last and num_val >= args.batch_size:
+        val_steps = num_val // args.batch_size
+    else:
+        val_steps = max(1, math.ceil(num_val / args.batch_size))
 
     # 3. Setup Optimizers
     # Temporal optimizer
@@ -514,7 +575,7 @@ def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalInteg
         f"  Phase 1 Epochs: {args.phase1_epochs} | Phase 2 Epochs: {args.phase2_epochs}\n"
         f"  Batch Size: {args.batch_size} | Clip Len: {args.clip_len} | K-Steps: {args.k_steps}\n"
         f"  Base LR: {args.lr} | Phase 2 Spatial LR: {args.lr * 0.1}\n"
-        f"  Train Clips: {num_train} | Val Clips: {num_val}\n"
+        f"  Train Clips: {num_train} | Val Clips: {num_val} | Dtype: {train_dict['shells'].dtype} | Drop Last: {drop_last}\n"
         f"  Save Dir: {args.save_dir}\n",
         flush=True,
     )
@@ -530,6 +591,14 @@ def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalInteg
             train_loss_accum = 0.0
             rollout_l1_accum = 0.0
             idm_loss_accum = 0.0
+
+            pbar = ProgressBar(
+                total=steps_per_epoch,
+                prefix=f"P{phase_num} Ep {epoch:02d}/{num_epochs:02d}",
+                log_every=args.log_every,
+                log_file=log_path,
+                process_tag=f"TemporalJEPA_P{phase_num}",
+            )
 
             for s in range(steps_per_epoch):
                 idx = perm[s * args.batch_size : (s + 1) * args.batch_size]
@@ -568,6 +637,15 @@ def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalInteg
                         anchor_weight=args.anchor_weight,
                     )
 
+                pbar.update(
+                    s + 1,
+                    {
+                        "Loss": loss,
+                        "RolloutL1": metrics["rollout_l1"],
+                        "IDM": metrics["idm_loss"],
+                    },
+                )
+
                 train_loss_accum += float(loss)
                 rollout_l1_accum += float(metrics["rollout_l1"])
                 idm_loss_accum += float(metrics["idm_loss"])
@@ -580,6 +658,13 @@ def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalInteg
             # Validation Loop
             val_loss_accum = 0.0
             val_c_list = []
+            val_pbar = ProgressBar(
+                total=val_steps,
+                prefix=f"P{phase_num} Val {epoch:02d}/{num_epochs:02d}",
+                log_every=args.log_every,
+                log_file=log_path,
+                process_tag=f"TemporalJEPA_P{phase_num}",
+            )
             for vs in range(val_steps):
                 v_idx = np.arange(vs * args.batch_size, min((vs + 1) * args.batch_size, num_val))
                 v_shells = jnp.asarray(val_dict["shells"][v_idx])
@@ -596,6 +681,14 @@ def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalInteg
                     omega=args.omega,
                     alpha=args.alpha,
                     beta=args.beta,
+                )
+                val_pbar.update(
+                    vs + 1,
+                    {
+                        "ValLoss": v_loss,
+                        "RolloutL1": v_metrics["rollout_l1"],
+                        "IDM": v_metrics["idm_loss"],
+                    },
                 )
                 val_loss_accum += float(v_loss)
                 val_c_list.append(np.asarray(c_seq))
@@ -636,16 +729,24 @@ def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalInteg
                     save_checkpoint(spat_best_ckpt, spatial_model, metadata=metadata)
 
             # Console output
-            print(
+            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            epoch_line = (
+                f"[{now_ts}] [TemporalJEPA_P{phase_num} PID {os.getpid()}] "
                 f"P{phase_num} Epoch [{epoch:02d}/{num_epochs:02d}] "
                 f"Step {global_step:04d} | "
                 f"Train Loss: {avg_train_loss:6.4f} | "
                 f"Val Loss: {avg_val_loss:6.4f} | "
                 f"Rollout L1: {avg_rollout_l1:5.3f} | "
                 f"IDM Loss: {avg_idm_loss:5.3f} | "
-                f"RankMe: {rankme_val:6.2f}",
-                flush=True,
+                f"RankMe: {rankme_val:6.2f}"
             )
+            print(epoch_line, flush=True)
+            if log_path:
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(epoch_line + "\n")
+                except Exception:
+                    pass
 
     # Final checkpoints
     save_checkpoint(os.path.join(args.save_dir, "temporal_last.pkl"), temporal_model, metadata=metadata)

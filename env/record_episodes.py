@@ -26,11 +26,48 @@ from env.curriculum import DistanceCurriculumScheduler
 from env.minecraft_env import MinecraftNavEnv
 
 
-def select_heuristic_action(goal_vec: np.ndarray, action_mask: Optional[np.ndarray]) -> int:
+def select_heuristic_action(goal_vec: np.ndarray, action_mask: Optional[np.ndarray] = None) -> int:
     """
     Selects a greedy movement action that points closest to goal_vec among valid actions.
     Ego coordinates: +Z is forward, +X is right, +Y is up.
+    Prioritizes turning (Action 6 Turn-Left, Action 7 Turn-Right) when target is outside forward cone.
     """
+    gx, gy, gz = float(goal_vec[0]), float(goal_vec[1]), float(goal_vec[2])
+    h_dist = float(np.hypot(gx, gz))
+    if h_dist < 0.5 and abs(gy) < 0.5:
+        return 11  # Stay / Idle
+
+    # Check forward cone: target is in front if gz > 0 and abs(gx) <= gz
+    not_in_forward_cone = (gz <= 0.0) or (abs(gx) > gz)
+
+    if not_in_forward_cone:
+        # Prioritize turning to face the goal
+        if gx < -0.2:
+            turn_act = 6  # Turn-Left (-45°)
+        elif gx > 0.2:
+            turn_act = 7  # Turn-Right (+45°)
+        else:
+            # Directly behind (gz <= 0 and abs(gx) <= 0.2)
+            turn_act = 7  # Turn-Right (+45°) to turn around
+
+        if action_mask is None or action_mask[turn_act]:
+            return turn_act
+
+    # Target is in forward cone (or turn action was masked)
+    # Check pitch if vertical offset is large and target is relatively close
+    if h_dist < 4.0:
+        if gy >= 2.0 and (action_mask is None or action_mask[9]):
+            return 9  # Pitch-Up
+        elif gy <= -2.0 and (action_mask is None or action_mask[10]):
+            return 10  # Pitch-Down
+
+    # If step-up needed
+    if gy >= 0.8:
+        if action_mask is None or action_mask[8]:
+            return 8  # Step-Up-Forward
+        elif action_mask is None or action_mask[1]:
+            return 1  # Forward+Jump
+
     actions_to_dir = {
         0: np.array([0.0, 0.0, 1.0]),     # Forward (+Z)
         1: np.array([-0.707, 0.0, 0.707]),# Forward-Left
@@ -41,12 +78,8 @@ def select_heuristic_action(goal_vec: np.ndarray, action_mask: Optional[np.ndarr
         8: np.array([0.0, 1.0, 1.0]),     # Step-Up-Forward (+Z, +Y)
     }
 
-    gx, gy, gz = goal_vec[0], goal_vec[1], goal_vec[2]
     norm = np.linalg.norm([gx, gy, gz])
-    if norm < 1e-4:
-        return 11  # Stay
-
-    target_dir = np.array([gx, gy, gz]) / norm
+    target_dir = np.array([gx, gy, gz]) / (norm + 1e-6)
     best_act = 0
     best_dot = -float("inf")
 

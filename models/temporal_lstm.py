@@ -202,6 +202,7 @@ class DualLSTMTemporalIntegrator(nnx.Module):
         state_t: jax.Array,
         action_t: jax.Array,
         hidden: Tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        disable_ego_shift: bool = False,
     ) -> Tuple[jax.Array, jax.Array, Tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
         """Run single temporal integration step.
 
@@ -222,11 +223,15 @@ class DualLSTMTemporalIntegrator(nnx.Module):
         delta_pos = state_t[:, 3:6]
 
         # 1. Ego-motion shifting across LOD scales (1.0, 2.0, 4.0)
-        scales = (1.0, 2.0, 4.0)
-        h_shifts = [ego_motion_shift_3d(h_sp[:, l], delta_pos, scales[l]) for l in range(3)]
-        c_shifts = [ego_motion_shift_3d(c_sp[:, l], delta_pos, scales[l]) for l in range(3)]
-        h_sp_shifted = jnp.stack(h_shifts, axis=1)
-        c_sp_shifted = jnp.stack(c_shifts, axis=1)
+        if disable_ego_shift:
+            h_sp_shifted = h_sp
+            c_sp_shifted = c_sp
+        else:
+            scales = (1.0, 2.0, 4.0)
+            h_shifts = [ego_motion_shift_3d(h_sp[:, l], delta_pos, scales[l]) for l in range(3)]
+            c_shifts = [ego_motion_shift_3d(c_sp[:, l], delta_pos, scales[l]) for l in range(3)]
+            h_sp_shifted = jnp.stack(h_shifts, axis=1)
+            c_sp_shifted = jnp.stack(c_shifts, axis=1)
 
         # 2. Update spatial memory with pooled slots
         slots_flat = self.pool_spatial(tokens_t)  # (B, 24, 256)
@@ -259,6 +264,7 @@ class DualLSTMTemporalIntegrator(nnx.Module):
         state_seq: jax.Array,
         action_seq: jax.Array,
         k_steps: int = 4,
+        disable_ego_shift: bool = False,
     ) -> Tuple[jax.Array, jax.Array]:
         """Unroll sequence over trajectory and perform k_steps autoregressive predictions.
 
@@ -282,7 +288,11 @@ class DualLSTMTemporalIntegrator(nnx.Module):
         hidden_list = []
         for t in range(T):
             z_hat, c_t, hidden = self.step(
-                tokens_seq[:, t], state_seq[:, t], action_seq[:, t], hidden
+                tokens_seq[:, t],
+                state_seq[:, t],
+                action_seq[:, t],
+                hidden,
+                disable_ego_shift=disable_ego_shift,
             )
             z_hat_list.append(z_hat)
             c_list.append(c_t)
@@ -307,7 +317,9 @@ class DualLSTMTemporalIntegrator(nnx.Module):
             for step_k in range(1, k_steps):
                 act_k = action_seq[:, t + step_k]
                 st_k = state_seq[:, t + step_k]
-                cur_z, _, h_roll = self.step(cur_z, st_k, act_k, h_roll)
+                cur_z, _, h_roll = self.step(
+                    cur_z, st_k, act_k, h_roll, disable_ego_shift=disable_ego_shift
+                )
                 k_preds.append(cur_z)
             rollouts.append(jnp.stack(k_preds, axis=1))
 

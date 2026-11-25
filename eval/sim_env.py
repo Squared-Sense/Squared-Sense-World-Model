@@ -419,9 +419,23 @@ class VoxelNavEnv:
             dtype=np.float32,
         )
 
-        # 3D goal vector relative to agent position
+        # 3D goal vector relative to agent position in cardinal egocentric frame
         goal_target = np.array(self.active_waypoint, dtype=np.float32)
-        goal_vec = goal_target - self.pos.astype(np.float32)
+        dx_w = goal_target[0] - float(self.pos[0])
+        dy_w = goal_target[1] - float(self.pos[1])
+        dz_w = goal_target[2] - float(self.pos[2])
+
+        cardinal_yaw = self.snapper.snap(self.yaw)
+        rad = math.radians(cardinal_yaw)
+        fwd_x = math.sin(rad)
+        fwd_z = math.cos(rad)
+        right_x = math.cos(rad)
+        right_z = -math.sin(rad)
+
+        ego_gx = float(dx_w * right_x + dz_w * right_z)
+        ego_gz = float(dx_w * fwd_x + dz_w * fwd_z)
+        ego_gy = float(dy_w)
+        goal_vec = np.array([ego_gx, ego_gy, ego_gz], dtype=np.float32)
 
         return {
             "shells": shells,
@@ -429,7 +443,7 @@ class VoxelNavEnv:
             "goal_vec": goal_vec,
         }
 
-    def reset(self) -> Dict[str, np.ndarray]:
+    def reset(self, seed: Optional[int] = None) -> Dict[str, np.ndarray]:
         """Reset environment to initial state."""
         if self.courses and len(self.courses) > 1:
             vol, st, wps, _ = self.courses[self.course_idx % len(self.courses)]

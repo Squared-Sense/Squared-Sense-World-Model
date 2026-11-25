@@ -117,10 +117,13 @@ class SiameseVoxelCNN(nnx.Module):
         self,
         in_channels: int = 16,
         embed_dim: int = 256,
+        spatial_size: int = 16,
         *,
         rngs: nnx.Rngs,
     ) -> None:
-        self.coord_conv = CoordConv3D(size=16)
+        self.spatial_size = spatial_size
+        self.grid_tokens = (spatial_size // 4) ** 3
+        self.coord_conv = CoordConv3D(size=spatial_size)
 
         # Stem: (16 + 3 = 19) -> 64, stride 2 -> (N, 8, 8, 8, 64)
         self.stem_conv = nnx.Conv(
@@ -180,7 +183,7 @@ class SiameseVoxelCNN(nnx.Module):
         h = self.stage2_block1(h)
         h = self.proj(h)
         batch_size = h.shape[0]
-        return h.reshape((batch_size, 64, 256))
+        return h.reshape((batch_size, self.grid_tokens, h.shape[-1]))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """Encode batch of multi-LOD concentric voxel shells.
@@ -194,5 +197,5 @@ class SiameseVoxelCNN(nnx.Module):
         b, lod, sx, sy, sz, c = x.shape
         x_flat = x.reshape((b * lod, sx, sy, sz, c))
         tokens = self.encode_single_shell(x_flat)
-        return tokens.reshape((b, lod * 64, tokens.shape[-1]))
+        return tokens.reshape((b, lod * self.grid_tokens, tokens.shape[-1]))
 

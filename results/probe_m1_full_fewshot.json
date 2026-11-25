@@ -1,0 +1,104 @@
+{
+  "model_type": "m1_full",
+  "feature_dim": 448,
+  "distant_goal": {
+    "r2": -4.422036647796631,
+    "r2_std": 0.0,
+    "mean_cosine_sim": -0.35584327578544617,
+    "mean_cosine_sim_std": 0.0
+  },
+  "local_hazard": {
+    "f1": 0.0,
+    "f1_std": 0.0,
+    "auroc": 1.0,
+    "auroc_std": 0.0
+  },
+  "kinematic_and_occlusion": {
+    "velocity_r2": -4.6394805908203125,
+    "velocity_r2_std": 0.0,
+    "occlusion_f1": 0.0,
+    "occlusion_f1_std": 0.0
+  },
+  "multistep_rollout": {
+    "cosine_sim_h1": 0.963616132736206,
+    "l1_error_h1": 0.21065610647201538,
+    "cosine_sim_h2": 0.9567566514015198,
+    "l1_error_h2": 0.22652073204517365,
+    "cosine_sim_h4": 0.9513913989067078,
+    "l1_error_h4": 0.2387053519487381,
+    "cosine_sim_h8": 0.940953254699707,
+    "l1_error_h8": 0.2641775906085968,
+    "rankme": 5.768675327301025
+  },
+  "r2": -4.422036647796631,
+  "mean_cosine_sim": -0.35584327578544617,
+  "f1": 0.0,
+  "auroc": 1.0,
+  "velocity_r2": -4.6394805908203125,
+  "occlusion_f1": 0.0,
+  "rankme": 5.768675327301025,
+  "few_shot": {
+    "0.1": {
+      "num_train_episodes": 1,
+      "distant_goal": {
+        "r2": -1.5481106738249462,
+        "r2_std": 0.7828140552996558,
+        "mean_cosine_sim": 0.25948424140612286
+      },
+      "local_hazard": {
+        "f1": 0.0,
+        "f1_std": 0.0,
+        "auroc": 1.0
+      },
+      "kinematic_and_occlusion": {
+        "velocity_r2": -28.926055694619816,
+        "occlusion_f1": 0.0
+      }
+    },
+    "0.25": {
+      "num_train_episodes": 2,
+      "distant_goal": {
+        "r2": -3.136714140574137,
+        "r2_std": 0.5974771224131141,
+        "mean_cosine_sim": 0.4165829122066498
+      },
+      "local_hazard": {
+        "f1": 0.0,
+        "f1_std": 0.0,
+        "auroc": 1.0
+      },
+      "kinematic_and_occlusion": {
+        "velocity_r2": -14.464116307596365,
+        "occlusion_f1": 0.0
+      }
+    },
+    "1.0": {
+      "distant_goal": {
+        "r2": -4.422036647796631,
+        "r2_std": 0.0,
+        "mean_cosine_sim": -0.35584327578544617,
+        "mean_cosine_sim_std": 0.0
+      },
+      "local_hazard": {
+        "f1": 0.0,
+        "f1_std": 0.0,
+        "auroc": 1.0,
+        "auroc_std": 0.0
+      },
+      "kinematic_and_occlusion": {
+        "velocity_r2": -4.6394805908203125,
+        "velocity_r2_std": 0.0,
+        "occlusion_f1": 0.0,
+        "occlusion_f1_std": 0.0
+      }
+    }
+  },
+  "cosine_sim_h1": 0.963616132736206,
+  "l1_error_h1": 0.21065610647201538,
+  "cosine_sim_h2": 0.9567566514015198,
+  "l1_error_h2": 0.22652073204517365,
+  "cosine_sim_h4": 0.9513913989067078,
+  "l1_error_h4": 0.2387053519487381,
+  "cosine_sim_h8": 0.940953254699707,
+  "l1_error_h8": 0.2641775906085968
+}

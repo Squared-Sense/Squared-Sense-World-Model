@@ -1,0 +1,20 @@
+{
+  "success_rate_pct": 30.0,
+  "spl": 0.2717013910446641,
+  "spl_pct": 27.17013910446641,
+  "waypoint_completion_pct": 50.0,
+  "mean_targets_reached": 2.5,
+  "num_targets": 5,
+  "hazard_collision_rate_pct": 45.0,
+  "empirical_mflops_per_step": 1770.06,
+  "latency_ms_per_step": 17.156125944409627,
+  "use_gating": false,
+  "total_episodes": 20,
+  "total_steps": 8021,
+  "mean_episode_length": 401.05,
+  "avg_steps_to_target_1": 40.57142857142857,
+  "avg_steps_to_target_2": 87.76923076923077,
+  "avg_steps_to_target_3": 145.7,
+  "avg_steps_to_target_4": 194.57142857142858,
+  "avg_steps_to_target_5": 265.3333333333333
+}

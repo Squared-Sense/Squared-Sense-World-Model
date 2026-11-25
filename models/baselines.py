@@ -223,3 +223,92 @@ class Generative3DMAE(nnx.Module):
 
         return pred_patches, target_patches, mse_loss
 
+
+def _get_block_tokens_32() -> jax.Array:
+    """Precompute the 64 disjoint 2x2x2 block token partitions of an 8x8x8 grid."""
+    bx, by, bz = jnp.meshgrid(jnp.arange(4), jnp.arange(4), jnp.arange(4), indexing="ij")
+    bx, by, bz = bx.reshape(-1), by.reshape(-1), bz.reshape(-1)  # (64,)
+    dx, dy, dz = jnp.meshgrid(jnp.arange(2), jnp.arange(2), jnp.arange(2), indexing="ij")
+    dx, dy, dz = dx.reshape(-1), dy.reshape(-1), dz.reshape(-1)  # (8,)
+    x = bx[:, None] * 2 + dx[None, :]
+    y = by[:, None] * 2 + dy[None, :]
+    z = bz[:, None] * 2 + dz[None, :]
+    return (x * 64 + y * 8 + z).astype(jnp.int32)  # shape (64, 8)
+
+
+_BLOCK_TOKENS_32: jax.Array = _get_block_tokens_32()
+
+
+def sample_3d_jepa_masks_32(
+    key: jax.Array,
+    batch_size: int,
+) -> Tuple[jax.Array, jax.Array]:
+    """Pure JAX 3D block masking over an 8x8x8 token grid (64 blocks of 8 tokens).
+
+    Selects 32 blocks (256 tokens) as target and 32 blocks (256 tokens) as visible context.
+    """
+    def sample_single(k: jax.Array) -> Tuple[jax.Array, jax.Array]:
+        perm = jax.random.permutation(k, 64)
+        tgt_blocks = perm[:32]
+        vis_blocks = perm[32:]
+        tgt_tokens = _BLOCK_TOKENS_32[tgt_blocks].reshape(-1)
+        vis_tokens = _BLOCK_TOKENS_32[vis_blocks].reshape(-1)
+        return vis_tokens, tgt_tokens
+
+    keys = jax.random.split(key, batch_size)
+    return jax.vmap(sample_single)(keys)
+
+
+class Uniform32JEPA(nnx.Module):
+    """Uniform 32^3 Spatial JEPA Baseline (Baseline B4).
+
+    Operates on a single uniform 1x-resolution 32x32x32x16 voxel grid (matching the
+    32^3 bounding volume of LOD-1 without 2x strided downsampling), producing
+    8x8x8 = 512 spatial tokens of dimension 256.
+    """
+
+    def __init__(self, *, rngs: nnx.Rngs) -> None:
+        self.jepa = SpatialJEPA(num_shells=1, spatial_size=32, rngs=rngs)
+
+    @property
+    def context_encoder(self) -> MultiLODBackbone:
+        return self.jepa.context_encoder
+
+    @property
+    def target_encoder(self) -> MultiLODBackbone:
+        return self.jepa.target_encoder
+
+    @property
+    def predictor(self) -> JEPAPredictor:
+        return self.jepa.predictor
+
+    def update_ema(self, momentum: float) -> None:
+        """Update target encoder parameters in-place via EMA."""
+        self.jepa.update_ema(momentum)
+
+    def count_trainable_params(self) -> int:
+        """Count trainable parameters in context encoder and predictor."""
+        return count_params(self.context_encoder) + count_params(self.predictor)
+
+    def __call__(
+        self,
+        x: jax.Array,
+        visible_idx: jax.Array,
+        target_idx: jax.Array,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """Forward pass on uniform 32x32x32x16 voxel grid.
+
+        Args:
+            x: (B, 32, 32, 32, 16) or (B, 1, 32, 32, 32, 16) float32 tensor.
+            visible_idx: (B, 256) visible token indices.
+            target_idx: (B, 256) target token indices.
+        """
+        if x.ndim == 5:
+            x_in = jnp.expand_dims(x, axis=1)
+        elif x.ndim == 6:
+            x_in = x
+        else:
+            raise ValueError(f"Expected 5D or 6D tensor, got shape {x.shape}")
+
+        return self.jepa(x_in, visible_idx, target_idx)
+
